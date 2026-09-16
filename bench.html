@@ -101,8 +101,15 @@ const outCtx = out.getContext('2d');
 
 const maskCv = makeCanvas(1, 1);             // マスクをアルファとして持つ
 let maskImg = null;                          // 解像度が変わるたびに作り直す
-let hasMask = false;                         // 最初の1枚が届くまでは合成しない
 const fg = makeCanvas(1, 1);                 // 手前レイヤー: 空を抜いた元映像
+
+// 分離に渡したフレームの控え。マスクが届いたら「そのマスクを作った元のフレーム」と
+// 対で合成する。最新フレームに古いマスクを載せると、カメラを振ったときに輪郭が
+// 1〜3 フレーム分ずれるため。表示レートは分離レートまで落ちるが、出る絵は必ず整合する。
+// 次の分離が走っている間も表示中の1枚を保つ必要があるので、2枚で回す。
+const shots = [makeCanvas(1, 1), makeCanvas(1, 1)];
+let shotIdx = 0;
+let display = null;                          // いま合成に使うフレーム（マスクと対）
 
 let segmenter = null;                        // モデル読み込み完了まで null
 
@@ -131,14 +138,16 @@ function updateMask({ width, height, data }) {
   }
   for (let i = 0; i < data.length; i++) maskImg.data[i * 4 + 3] = data[i] * 255;
   maskCv.ctx.putImageData(maskImg, 0, 0);
-  hasMask = true;
 }
 
 // --- 描画 ---
-// 分離とは独立に回り、そのときの最新マスクを使い回す。分離が 25fps でも
-// 表示は端末の描画レートのまま進む（マスクの追従だけが 1〜2 フレーム遅れる）。
+// マスクと、そのマスクを作った元のフレームが揃ったときだけ描く。
+// 毎フレーム描いて最新の映像に古いマスクを載せると、カメラを振ったときに
+// 輪郭がずれる。表示は分離のレートになるが、出る絵は必ず整合している。
 function renderFrame() {
-  const [vw, vh] = sizeOf(active);
+  if (!display) return;
+  const vw = display.el.width;
+  const vh = display.el.height;
   if (!vw) return;
 
   if (out.width !== vw || out.height !== vh) {
@@ -149,13 +158,11 @@ function renderFrame() {
   const t0 = performance.now();
 
   // --- 1. 手前レイヤー: 元映像から空を抜く ---
-  if (hasMask) {
-    fg.ctx.globalCompositeOperation = 'source-over';
-    fg.ctx.clearRect(0, 0, vw, vh);
-    fg.ctx.drawImage(active, 0, 0, vw, vh);
-    fg.ctx.globalCompositeOperation = 'destination-out';
-    fg.ctx.drawImage(maskCv.el, 0, 0, vw, vh);   // GPU が拡大（正方形→元の縦横比に戻る）
-  }
+  fg.ctx.globalCompositeOperation = 'source-over';
+  fg.ctx.clearRect(0, 0, vw, vh);
+  fg.ctx.drawImage(display.el, 0, 0);
+  fg.ctx.globalCompositeOperation = 'destination-out';
+  fg.ctx.drawImage(maskCv.el, 0, 0, vw, vh);   // GPU が拡大（正方形→元の縦横比に戻る）
 
   // --- 2. 奥から順に重ねる ---
   // 手前レイヤー（空を抜いた元映像 = 建物）は両モード共通。奥だけが違う。
@@ -163,15 +170,19 @@ function renderFrame() {
     outCtx.fillStyle = fillColor.value;
     outCtx.fillRect(0, 0, vw, vh);             // 奥:   単色プレーン
   } else {
-    outCtx.drawImage(active, 0, 0, vw, vh);    // 奥:   元映像（空はここが見える）
+    outCtx.drawImage(display.el, 0, 0);        // 奥:   元映像（空はここが見える）
     drawKaiju(vw, vh);                         // 中:   怪獣（加工なし）
   }
-  if (hasMask) outCtx.drawImage(fg.el, 0, 0);  // 手前: 空を抜いた元映像 = 建物
+  outCtx.drawImage(fg.el, 0, 0);               // 手前: 空を抜いた元映像 = 建物
 
   // drawImage は GPU に積むだけで完了を待たないので、合成の実コストは
   // ここに全部は現れない。それでも合成の発行は区間に入る。
   accDraw += performance.now() - t0; nDraw++;
 }
+
+// モードや色を変えたときは、次のマスクを待たずに描き直す
+mode.onchange = renderFrame;
+fillColor.oninput = renderFrame;
 
 // 大きさも位置も「高さ」基準で決める。幅基準にすると横長のソースで
 // 幅由来の大きさが画面の高さを超え、上にはみ出す（cloudy01 で発生）。
@@ -186,8 +197,9 @@ function drawKaiju(vw, vh) {
 }
 
 // --- 計測 ---
-// 描画と分離は別々のレートで回るので、別々に出す。SkyMaskCV の
-// 「ms/frame」に対応するのは分離のほう（1枚のマスクを作る実コスト）。
+// 表示は「マスクとフレームの対が揃うたび」なので、描画レートは分離レートと
+// 同じになる。SkyMaskCV の「ms/frame」に対応するのは分離のほう
+// （1枚のマスクを作る実コスト）。左の元映像だけはカメラのレートで動く。
 const stats = document.getElementById('stats');
 let accDraw = 0, nDraw = 0, lastStats = performance.now();
 let segMs = 0, segCount = 0, lastTimings = null;
@@ -199,7 +211,7 @@ function report() {
   if (!nDraw || span < 1) return;
   const drawFps = (nDraw / span) * 1000;
   const segFps = (segCount / span) * 1000;
-  stats.textContent = `描画 ${drawFps.toFixed(0)} fps (合成 ${(accDraw / nDraw).toFixed(2)} ms)`
+  stats.textContent = `表示 ${drawFps.toFixed(0)} fps (合成 ${(accDraw / nDraw).toFixed(2)} ms)`
                     + `  分離 ${segMs.toFixed(1)} ms → ${segFps.toFixed(1)} fps`
                     + `  ${maskCv.el.width}×${maskCv.el.height}`;
   accDraw = 0; nDraw = 0; segCount = 0; lastStats = now;
@@ -207,28 +219,28 @@ function report() {
 setInterval(report, 1000);
 
 // --- ループ ---
-// 描画は動画なら requestVideoFrameCallback（rAF だと 60Hz で 30fps の映像を
-// 舐めて計測値が実態とずれる）、静止画は rAF。
-// 分離は別ループで、端末の速度なりに回す。await を跨ぐので、次の1枚は
-// 必ず前の1枚が終わってから投げる（重ねると古い結果を待つ遅れが積み上がる）。
+// 1 本だけ。分離が 1 枚終わるたびに、その元フレームと対で描く。
+// await を跨ぐので、次の1枚は必ず前の1枚が終わってから投げる
+// （重ねると古い結果を待つ遅れが積み上がる）。
 let loopId = 0;
-function startLoops() {
+function startLoop() {
   const id = ++loopId;
-
-  const step = () => {
-    if (id !== loopId) return;
-    renderFrame();
-    if (active === video && video.requestVideoFrameCallback) video.requestVideoFrameCallback(step);
-    else requestAnimationFrame(step);
-  };
-  step();
-
   (async () => {
     while (id === loopId) {
-      if (!segmenter || !sizeOf(active)[0]) {  // 準備前、または寸法がまだ来ていない
+      const [vw, vh] = sizeOf(active);
+      if (!segmenter || !vw) {                 // 準備前、または寸法がまだ来ていない
         await new Promise((r) => requestAnimationFrame(r));
         continue;
       }
+
+      // 分離に渡すフレームを、同じ同期ブロックの中で控える。segment() の中の
+      // 取り込み（drawImage）も await より手前で走るので、両者は必ず同じ1枚を見る。
+      const shot = shots[shotIdx];
+      if (shot.el.width !== vw || shot.el.height !== vh) {
+        shot.el.width = vw; shot.el.height = vh;
+      }
+      shot.ctx.drawImage(active, 0, 0, vw, vh);
+
       const t0 = performance.now();
       let mask;
       try {
@@ -245,6 +257,9 @@ function startLoops() {
       lastTimings = mask.timings;              // 工程別の内訳（bench.html が読む）
       pushTimings(segMs, mask.timings);        // ← 計測版だけ
       updateMask(mask);
+      display = shot;                          // ここで対が揃う
+      shotIdx ^= 1;                            // 次の分離は空いている方へ描く
+      renderFrame();
     }
   })();
 }
@@ -293,7 +308,7 @@ async function selectSource(i) {
   const s = SOURCES[i];
 
   loopId++;                                    // 走っているループをまず止める
-  hasMask = false;                             // 縦横比が変わるので前のマスクは捨てる
+  display = null;                              // 縦横比が変わるので前の対は捨てる
   video.srcObject?.getTracks().forEach((t) => t.stop());
   video.srcObject = null;
   video.removeAttribute('src');
@@ -319,7 +334,7 @@ async function selectSource(i) {
 
   stats.textContent = '—';
   accDraw = 0; nDraw = 0; segCount = 0; lastStats = performance.now();
-  startLoops();
+  startLoop();
 }
 
 select.onchange = () => selectSource(Number(select.value));
