@@ -54,10 +54,9 @@
   <b>開始直後と 1 分後の両方</b>を控えます（熱ダレで配分が変わるため）。
   <br>refineSize:
   <a href="?refine=512">512（現行）</a> /
-  <a href="?refine=384">384</a> /
   <a href="?refine=256">256</a>
-  — 取り込みも読み戻しもこの解像度で行うので、実機で最大コストの
-  <code>getImageData</code> はこの値の2乗で効きます。
+  — 取り込みも読み戻しもこの解像度で行います。<b>inputSize (256) の整数倍だけ</b>
+  有効で、それ以外は丸められます（384 は 512 になる）。実際の値は下の行に出ます。
 </p>
 <pre id="breakdown">計測待ち…</pre>
 
@@ -287,7 +286,8 @@ function startBreakdown() {
     const t = segTimings();
     const total = t['合計']?.ms;
     breakdown.textContent =
-      `refineSize ${REFINE}（取り込み ${REFINE}×${REFINE}） / 経過 ${((performance.now() - t0) / 1000).toFixed(0)} 秒`
+      `取り込み ${segmenter.maskSize}×${segmenter.maskSize}（refineSize=${REFINE} の指定）`
+      + ` / 経過 ${((performance.now() - t0) / 1000).toFixed(0)} 秒`
       + ` / 直近 ${t['合計']?.n ?? 0} フレームの中央値\n`
       + row('分離の合計', total ?? '—') + '\n'
       + Object.entries(t).filter(([k]) => k !== '合計')

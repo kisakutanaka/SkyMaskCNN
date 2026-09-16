@@ -26,8 +26,10 @@ export const SKY_SEGMENTER_DEFAULTS = {
   // マスクの境界を被写体の輪郭へ吸着させる（0 にすると無効）。
   refineRadius: 4, // ガイデッドフィルタの半径（inputSize 上の画素数）
   refineEps: 1e-4,
-  // 出力マスクの解像度。inputSize の整数倍にすること。
-  // ここを上げるほど輪郭がシャープになる（コストは後述の fast guided filter で微増のみ）。
+  // 出力マスクの解像度。inputSize の整数倍に丸められる（384 を渡せば 512 になる）。
+  // ここを上げるほど輪郭がシャープになるが、取り込みと読み戻しもこの解像度で
+  // 行うため、実機では getImageData の同期待ちが上限を決める。実際の値は
+  // 生成後に maskSize で確認できる。
   refineSize: 512,
   // 確率の 0→1 遷移をどれだけ立てるか。1 でそのまま、大きいほど輪郭がくっきりする。
   // 0.5 を境に (p-0.5)*k+0.5 で伸ばすだけなので、位置はずらさず境界の幅だけ縮む。
@@ -57,8 +59,12 @@ export async function createSkySegmenter(options = {}) {
   const size = cfg.inputSize;
   // 映像はマスク解像度で取り込み、モデル入力はそこから面積平均で縮小する。
   // getImageData が 1 回で済み、縮小も単純間引きよりきれいになる。
-  const capture = Math.max(size, cfg.refineSize);
-  const pool = Math.max(1, Math.round(capture / size)); // 何画素を 1 画素に畳むか
+  // 畳み込む画素数を先に決め、取り込み解像度をそこから導く。refineSize を
+  // そのまま使うと inputSize の整数倍でない値（384 など）で縮小ループが
+  // capture の外を読み、NaN が入ったまま動き続ける（384 実測: 「縮小と正規化」が
+  // 0.5ms → 8ms に跳ね、マスクも壊れる）。呼び出し側の値は丸めて受ける。
+  const pool = Math.max(1, Math.round(cfg.refineSize / size)); // 何画素を 1 画素に畳むか
+  const capture = size * pool;                                 // 必ず inputSize の整数倍
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = capture;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
