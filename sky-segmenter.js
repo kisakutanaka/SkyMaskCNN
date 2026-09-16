@@ -42,12 +42,6 @@ export const SKY_SEGMENTER_DEFAULTS = {
   // 確率の 0→1 遷移をどれだけ立てるか。1 でそのまま、大きいほど輪郭がくっきりする。
   // 0.5 を境に (p-0.5)*k+0.5 で伸ばすだけなので、位置はずらさず境界の幅だけ縮む。
   edgeSharpness: 6,
-  // 取り込んだ 1 枚を Worker へ渡す方法。
-  //   'async'    : createImageBitmap(canvas)。非同期なので、GPU の描画完了を
-  //                待つ間もメインスレッドは止まらない（既定）
-  //   'transfer' : OffscreenCanvas.transferToImageBitmap()。同期。実機では
-  //                その直後の postMessage で 33ms 待たされた（熱ダレ時）
-  captureMode: 'async',
   // onnxruntime-web。ESM 版を Worker 側が import する。
   ortUrl: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.wasm.min.mjs',
   ortWasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/',
@@ -56,7 +50,7 @@ export const SKY_SEGMENTER_DEFAULTS = {
 export async function createSkySegmenter(options = {}) {
   const cfg = { ...SKY_SEGMENTER_DEFAULTS, ...options };
   // ?v= は index.html 側と揃える（古いキャッシュとの食い違いを防ぐ）
-  const worker = new Worker(new URL('./sky-segmenter.worker.js?v=3', import.meta.url), {
+  const worker = new Worker(new URL('./sky-segmenter.worker.js?v=4', import.meta.url), {
     type: 'module',
   });
 
@@ -76,14 +70,11 @@ export async function createSkySegmenter(options = {}) {
     for (const { reject } of waiting.values()) reject(err);
     waiting.clear();
   };
-  let postMs = 0; // 直近の postMessage にかかった時間（内訳表示用）
   const ask = (msg, transfer = []) =>
     new Promise((resolve, reject) => {
       const id = ++seq;
       waiting.set(id, { resolve, reject });
-      const t = performance.now();
       worker.postMessage({ ...msg, id }, transfer);
-      postMs = performance.now() - t;
     });
 
   const ready = await ask({ type: 'init', cfg });
@@ -93,61 +84,40 @@ export async function createSkySegmenter(options = {}) {
   // 元の要素から直接 createImageBitmap すると、実測で 1958×1290 の静止画に
   // 14.8ms かかる（フル解像度のビットマップを作るため。resizeWidth を付けても
   // 変わらない）。小さいキャンバスへ一度描いてから渡すと 0.6ms で済む。
-  const capture = cfg.captureMode === 'transfer'
-    ? new OffscreenCanvas(ready.maskSize, ready.maskSize)
-    : Object.assign(document.createElement('canvas'), { width: ready.maskSize, height: ready.maskSize });
+  const capture = Object.assign(document.createElement('canvas'), {
+    width: ready.maskSize,
+    height: ready.maskSize,
+  });
   const captureCtx = capture.getContext('2d');
 
-  // 返し終わったマスクのバッファを貯めておき、次のフレームで Worker へ返す。
-  // 2 枚以上を同時に投げられるようにしたので、1 枚だけ持つ形ではなく池にする。
-  const pool = [];
+  // 前のフレームで返ってきたマスク。次のフレームで Worker に返して使い回す。
+  let spare = null;
 
   /**
    * @param {CanvasImageSource} source video / canvas / img / ImageBitmap
-   * @returns {Promise<{width:number, height:number, data:Float32Array, timings:object}>}
-   *          空である確率(0..1)と、Worker 側で測った工程別の所要 ms
+   * @returns {Promise<{width:number, height:number, data:Float32Array}>} 空である確率(0..1)
    *
-   * ※ data は Worker と往復して使い回しているバッファです。使い終わったら
-   *   recycle(mask) を呼んでください（呼ぶと次のフレームで Worker が再利用します）。
-   *   recycle 後に触ると中身は空です。跨いで持つならコピーしてください。
+   * ※ data は Worker と往復して使い回しているバッファです。次の segment() で
+   *   持っていかれるので、フレームを跨いで持つ場合はコピーしてください。
+   *   同時に呼べるのは 1 枚までです（前の 1 枚を待ってから次を呼ぶ）。
    */
   async function segment(source) {
     // 取り込みはここだけ。drawImage は GPU に積むだけで完了を待たず、
-    // transferToImageBitmap は中身を持ち出すだけなので、どちらも同期読み戻しを
-    // 起こさない。正方形に潰すのもここ（縦横比は呼び出し側が拡大で戻す）。
-    const t0 = performance.now();
+    // createImageBitmap は非同期なので、GPU の描画完了を待つ間もメインスレッドは
+    // 止まらない（元の要素から直接 createImageBitmap すると、1958×1290 の静止画で
+    // 14.8ms かかる。小さいキャンバスへ一度描いてから渡すと 0.6ms で済む）。
+    // 正方形に潰すのもここ（縦横比は呼び出し側が拡大で戻す）。
     captureCtx.drawImage(source, 0, 0, capture.width, capture.height);
-    // ここで ImageBitmap にする。transferToImageBitmap は同期で、中身がまだ
-    // GPU 側にあると、その後の postMessage が完了待ちで止まる（実機で 33ms）。
-    // createImageBitmap は非同期なので、その待ちをメインスレッドの外に出せる。
-    const bitmap = cfg.captureMode === 'transfer'
-      ? capture.transferToImageBitmap()
-      : await createImageBitmap(capture);
-    const out = pool.pop() ?? null;
+    const bitmap = await createImageBitmap(capture);
     const transfer = [bitmap];
-    if (out) transfer.push(out.buffer);
-    const sync = performance.now() - t0;
-    const pending = ask({ type: 'frame', bitmap, out }, transfer);
-    const post = postMs;            // ask() の postMessage は同期。自分のぶんを今のうちに取る
-    const res = await pending;
-    // 取り込みと往復も内訳に混ぜる。Worker 内の合計との差がここに出る。
-    res.timings['取り込み(メイン)'] = sync;
-    res.timings['postMessage'] = post;
-    res.timings['往復と待ち'] = performance.now() - t0 - sync - res.timings['合計'];
+    if (spare) transfer.push(spare.buffer);
+    const res = await ask({ type: 'frame', bitmap, out: spare }, transfer);
+    spare = res.data;
     return res;
-  }
-
-  /**
-   * 使い終わったマスクを返して、次のフレームで使い回してもらう。
-   * 呼ばなくても動くが、毎フレーム 1MB の確保が Worker 側で起きる。
-   */
-  function recycle(mask) {
-    if (mask?.data?.length) pool.push(mask.data);
   }
 
   return {
     segment,
-    recycle,
     inputSize: ready.inputSize,
     maskSize: ready.maskSize,
     coeffSize: ready.coeffSize,

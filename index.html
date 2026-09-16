@@ -28,12 +28,6 @@
   [hidden] { display: none !important; }
   .pane { align-self: flex-start; }
   select { font: inherit; padding: 3px 6px; }
-  /* ?bench のときだけ差し込まれる */
-  #howto { margin: 0 12px 8px; color: #ca8; font-size: 12px; max-width: 46em; }
-  #howto a { color: #8ad; }
-  #breakdown { margin: 0 12px 8px; padding: 8px 10px; background: #000; color: #7c7;
-    font: 12px/1.5 ui-monospace, monospace; font-variant-numeric: tabular-nums;
-    white-space: pre; overflow-x: auto; }
 </style>
 
 <header>
@@ -61,7 +55,7 @@
 // ?v= は古いキャッシュとの食い違いを防ぐ版数。sky-segmenter 側に手を入れたら、
 // ここと sky-segmenter.js の Worker URL の両方を上げる（片方だけ新しくなると、
 // 新しい index.html が古い API を呼んで静かに止まる）。
-import { createSkySegmenter } from './sky-segmenter.js?v=3';
+import { createSkySegmenter } from './sky-segmenter.js?v=4';
 
 // テストソース。増やすときはここに1行足すだけ。
 const SOURCES = [
@@ -71,57 +65,40 @@ const SOURCES = [
   { label: 'カメラ',            kind: 'camera' },
 ];
 
-// 構成はクエリで差し替えられる。?bench を付けると工程別の内訳も画面に出る
-// （実機にはコンソールが無いので、そのまま読めるようにしてある）。
-const params = new URLSearchParams(location.search);
-const num = (key, fallback) => Number(params.get(key)) || fallback;
-
 // 処理解像度はモデル側で決まる。tinyskynet_skyseg_256 は入力 256×256 固定
 // （出力は 128×128 のロジット）で、それをガイデッドフィルタで refineSize まで
-// 起こしたものがマスクになる。入力が正方形固定なので縦横比は一度潰し、
-// マスクを元の縦横比へ引き伸ばして戻す。
+// 起こしたものがマスクになる。SkyMaskCV の PROC_PIXELS に相当するつまみはここ。
+// 入力が正方形固定なので縦横比は一度潰し、マスクを元の縦横比へ引き伸ばして戻す。
 const SEGMENTER_OPTIONS = {
   modelUrl: './models/tinyskynet_skyseg_256.onnx',
-  refineSize: num('refine', 512),
-  coeffSize: num('coeff', 128),
-  captureMode: params.get('capture') || 'async',
+  refineSize: 512,
 };
-
-// 同時に Worker へ投げておく枚数。1 だと「投げる→待つ→次を投げる」になり、
-// 往復の待ちのあいだ Worker が遊ぶ（実機で 1 枚 46ms のうち 14ms が待ちだった）。
-// 2 にすると次の 1 枚が Worker の手元に積まれ、その待ちが隠れる。
-// 引き換えに、表示は 1 枚ぶん余分に古くなる。
-const DEPTH = num('depth', 2);
 
 const video = document.getElementById('video');
 const still = document.getElementById('still');
 const mode = document.getElementById('mode');
 const fillColor = document.getElementById('fillColor');
-const stats = document.getElementById('stats');
 const out = document.getElementById('out');
 const outCtx = out.getContext('2d');
+
+// 分離に渡した1枚の控え。分離は数十 ms かかるので、その間に映像は先へ進む。
+// 最新フレームに返ってきたマスクを載せると、カメラを振ったときに輪郭が
+// 1〜3 フレーム分ずれる。渡した1枚を控えておき、対で合成する。
+const shot = makeCanvas(1, 1);
+const maskCv = makeCanvas(1, 1);             // マスクをアルファとして持つ
+let maskImg = null;                          // 解像度が変わるたびに作り直す
+const fg = makeCanvas(1, 1);                 // 手前レイヤー: 空を抜いた元映像
+
+let segmenter = null;                        // モデル読み込み完了まで null
 
 const kaiju = new Image();
 kaiju.src = 'kaiju.png';
 
-function makeCanvas() {
+function makeCanvas(w, h) {
   const el = document.createElement('canvas');
+  el.width = w; el.height = h;
   return { el, ctx: el.getContext('2d') };
 }
-
-const maskCv = makeCanvas();                 // マスクをアルファとして持つ
-let maskImg = null;                          // 解像度が変わるたびに作り直す
-const fg = makeCanvas();                     // 手前レイヤー: 空を抜いた元映像
-
-// 分離に渡したフレームの控え。マスクが届いたら「そのマスクを作った元のフレーム」と
-// 対で合成する。最新フレームに古いマスクを載せると、カメラを振ったときに輪郭が
-// 1〜3 フレーム分ずれるため。表示レートは分離レートまで落ちるが、出る絵は必ず整合する。
-// 投げてある DEPTH 枚 + 表示中の 1 枚 + 余裕 1 枚を回す。
-const shots = Array.from({ length: DEPTH + 2 }, makeCanvas);
-let shotIdx = 0;
-let display = null;                          // いま合成に使うフレーム（マスクと対）
-
-let segmenter = null;                        // モデル読み込み完了まで null
 
 /** いま描画元になっている要素と、その実寸 */
 let active = video;
@@ -129,59 +106,63 @@ const sizeOf = (el) => el === video
   ? [el.videoWidth, el.videoHeight]
   : [el.naturalWidth, el.naturalHeight];
 
-// --- マスクの取り込み ---
-// 古典CV版は 0/1 の二値だが、CNN はそのまま確率を返す。しきい値で潰さずに
-// アルファへ流し込むと、境界が確率のままぼけて合成が馴染む。
-function updateMask({ width, height, data }) {
-  if (maskCv.el.width !== width || maskCv.el.height !== height) {
-    maskCv.el.width = width; maskCv.el.height = height;
-    maskImg = maskCv.ctx.createImageData(width, height);
+async function render() {
+  const [vw, vh] = sizeOf(active);
+  if (!segmenter || !vw) {                   // 準備前、または寸法がまだ来ていない
+    await new Promise((r) => requestAnimationFrame(r));
+    return;
   }
-  for (let i = 0; i < data.length; i++) maskImg.data[i * 4 + 3] = data[i] * 255;
-  maskCv.ctx.putImageData(maskImg, 0, 0);
-}
-
-// --- 描画 ---
-// マスクと、そのマスクを作った元のフレームが揃ったときだけ描く。
-function renderFrame() {
-  if (!display) return;
-  const vw = display.el.width;
-  const vh = display.el.height;
-  if (!vw) return;
 
   if (out.width !== vw || out.height !== vh) {
     out.width = vw; out.height = vh;
     fg.el.width = vw; fg.el.height = vh;
+    shot.el.width = vw; shot.el.height = vh;
   }
 
-  const t0 = performance.now();
+  // --- 1. 分離に渡す1枚を控えて、分離する ---
+  // 控えと segment() の中の取り込みは同じ同期ブロックで走るので、必ず同じ1枚を見る
+  // （フレームの提示はタスクの切れ目でしか起きない）。
+  // 計測はこのフレームの全工程を覆う。取り込み・推論・精緻化は Worker 側にあり、
+  // メインスレッドに残るのは控えと合成だけ。
+  const tFrame = performance.now();
+  shot.ctx.drawImage(active, 0, 0, vw, vh);
 
-  // --- 1. 手前レイヤー: 元映像から空を抜く ---
+  const tSeg = performance.now();
+  const mask = await segmenter.segment(active);   // data[i] = 空である確率 0..1
+  const segMs = performance.now() - tSeg;
+
+  // --- 2. マスクをアルファに載せる（空=不透明） ---
+  // 古典CV版は 0/1 の二値だが、CNN はそのまま確率を返す。しきい値で潰さずに
+  // アルファへ流し込むと、境界が確率のままぼけて合成が馴染む。
+  if (maskCv.el.width !== mask.width || maskCv.el.height !== mask.height) {
+    maskCv.el.width = mask.width; maskCv.el.height = mask.height;
+    maskImg = maskCv.ctx.createImageData(mask.width, mask.height);
+  }
+  for (let i = 0; i < mask.data.length; i++) maskImg.data[i * 4 + 3] = mask.data[i] * 255;
+  maskCv.ctx.putImageData(maskImg, 0, 0);
+
+  // --- 3. 手前レイヤー: 元映像から空を抜く ---
   fg.ctx.globalCompositeOperation = 'source-over';
   fg.ctx.clearRect(0, 0, vw, vh);
-  fg.ctx.drawImage(display.el, 0, 0);
+  fg.ctx.drawImage(shot.el, 0, 0);
   fg.ctx.globalCompositeOperation = 'destination-out';
   fg.ctx.drawImage(maskCv.el, 0, 0, vw, vh);   // GPU が拡大（正方形→元の縦横比に戻る）
 
-  // --- 2. 奥から順に重ねる ---
+  // --- 4. 奥から順に重ねる ---
   // 手前レイヤー（空を抜いた元映像 = 建物）は両モード共通。奥だけが違う。
   if (mode.value === 'fill') {
     outCtx.fillStyle = fillColor.value;
     outCtx.fillRect(0, 0, vw, vh);             // 奥:   単色プレーン
   } else {
-    outCtx.drawImage(display.el, 0, 0);        // 奥:   元映像（空はここが見える）
+    outCtx.drawImage(shot.el, 0, 0);           // 奥:   元映像（空はここが見える）
     drawKaiju(vw, vh);                         // 中:   怪獣（加工なし）
   }
   outCtx.drawImage(fg.el, 0, 0);               // 手前: 空を抜いた元映像 = 建物
 
   // drawImage は GPU に積むだけで完了を待たないので、合成の実コストは
   // ここに全部は現れない。それでも合成の発行は区間に入る。
-  accDraw += performance.now() - t0; nDraw++;
+  report(segMs, performance.now() - tFrame, mask.width, mask.height);
 }
-
-// モードや色を変えたときは、次のマスクを待たずに描き直す
-mode.onchange = renderFrame;
-fillColor.oninput = renderFrame;
 
 // 大きさも位置も「高さ」基準で決める。幅基準にすると横長のソースで
 // 幅由来の大きさが画面の高さを超え、上にはみ出す（cloudy01 で発生）。
@@ -195,134 +176,31 @@ function drawKaiju(vw, vh) {
   outCtx.drawImage(kaiju, (vw - w) / 2, vh * KAIJU_FEET - h, w, h);
 }
 
+const stats = document.getElementById('stats');
+let accSeg = 0, accAll = 0, n = 0;
+function report(segMs, allMs, pw, ph) {
+  accSeg += segMs; accAll += allMs; n++;
+  if (n < 15) return;
+  const seg = accSeg / n, all = accAll / n;
+  stats.textContent = `${all.toFixed(2)} ms/frame  ${(1000 / all).toFixed(0)} fps相当`
+                    + `  (分離 ${seg.toFixed(2)} / 控え・合成 ${(all - seg).toFixed(2)})  ${pw}×${ph}`;
+  accSeg = accAll = n = 0;
+}
+
 // --- ループ ---
-// 1 本だけ。DEPTH 枚を投げておき、返ってきた順に対で描く。
+// 1 フレームに 1 回 render()。分離が await を跨ぐので、次の1枚は必ず前の1枚が
+// 終わってから始める（重ねると古い結果を待つ遅れが積み上がる）。
 // 全体を 1 つの catch で囲む。細かく囲むと、囲み忘れたところで例外が出たときに
 // ループごと静かに死ぬ（画面には何も出ないまま止まる、いちばん困る壊れ方）。
 let loopId = 0;
 function startLoop() {
   const id = ++loopId;
-  loopStarted = performance.now();
   (async () => {
-    const inflight = [];                       // 投げてあるぶん（先頭が最も古い）
-    while (id === loopId) {
-      const [vw, vh] = sizeOf(active);
-      if (!segmenter || !vw) {                 // 準備前、または寸法がまだ来ていない
-        await new Promise((r) => requestAnimationFrame(r));
-        continue;
-      }
-
-      // 投げられるだけ投げる。控えは segment() と同じ同期ブロックで撮る
-      // （segment() 側の取り込みも await より手前で走るので、必ず同じ1枚を見る）。
-      while (inflight.length < DEPTH) {
-        const shot = shots[shotIdx];
-        shotIdx = (shotIdx + 1) % shots.length;
-        if (shot.el.width !== vw || shot.el.height !== vh) {
-          shot.el.width = vw; shot.el.height = vh;
-        }
-        shot.ctx.drawImage(active, 0, 0, vw, vh);
-        inflight.push({ shot, at: performance.now(), pending: segmenter.segment(active) });
-      }
-
-      const job = inflight.shift();
-      const mask = await job.pending;
-      if (id !== loopId) return;               // await の間に切り替わっていたら捨てる
-
-      segMs = performance.now() - job.at;      // 投げてから返るまで（＝表示の遅れ）
-      segCount++;
-      sample(segMs, mask.timings);
-
-      updateMask(mask);
-      segmenter.recycle(mask);                 // バッファは返して使い回してもらう
-      display = job.shot;                      // ここで対が揃う
-      renderFrame();
-    }
+    while (id === loopId) await render();
   })().catch((err) => {
     console.error(err);
-    fatal = true;
     stats.textContent = `止まりました: ${err.message}（再読み込みしてください）`;
   });
-}
-
-// --- 計測 ---
-// 表示は「対が揃うたび」なので、描画レートは分離レートと同じになる。
-// SkyMaskCV の「ms/frame」に対応するのは「分離 ms/枚」のほう。
-// 「遅れ」は投げてから返るまでで、DEPTH 枚を同時に投げているぶん ms/枚 より長い。
-// 左の元映像だけはカメラのレートで動く。
-let accDraw = 0, nDraw = 0, lastStats = performance.now(), loopStarted = 0;
-let segMs = 0, segCount = 0, fatal = false;
-
-setInterval(() => {
-  if (fatal) return;
-  const now = performance.now();
-  const span = now - lastStats;
-  if (span < 1) return;
-  if (!nDraw) {                                // まだ 1 枚も出ていない
-    if (loopStarted && now - loopStarted > 6000) {
-      stats.textContent = '分離の結果が返ってきません（再読み込みしてください）';
-    }
-    lastStats = now;
-    return;
-  }
-  stats.textContent = `表示 ${((nDraw / span) * 1000).toFixed(0)} fps`
-                    + ` (合成 ${(accDraw / nDraw).toFixed(2)} ms)`
-                    + `  分離 ${(span / segCount).toFixed(1)} ms/枚 → ${((segCount / span) * 1000).toFixed(1)} fps`
-                    + `  遅れ ${segMs.toFixed(0)} ms`
-                    + `  ${maskCv.el.width}×${maskCv.el.height}`;
-  accDraw = 0; nDraw = 0; segCount = 0; lastStats = now;
-}, 1000);
-
-// --- 工程別の内訳（?bench のときだけ）---
-// 直近 60 枚の中央値。値は Worker とメインスレッドが performance.now() で測った生の ms。
-const BENCH = params.has('bench');
-let sample = () => {};
-if (BENCH) {
-  const KEEP = 60;
-  const rings = new Map();
-  const median = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
-  const pad = (s, w) => s + ' '.repeat(Math.max(0, w - [...s]
-    .reduce((n, c) => n + (c.charCodeAt(0) > 0x2e80 ? 2 : 1), 0)));
-
-  sample = (totalMs, timings) => {
-    for (const [k, v] of [['分離（呼び出し側）', totalMs], ...Object.entries(timings)]) {
-      const a = rings.get(k) ?? rings.set(k, []).get(k);
-      a.push(v);
-      if (a.length > KEEP) a.shift();
-    }
-  };
-
-  document.querySelector('header').insertAdjacentHTML('afterend', `
-    <p id="howto">
-      <b>これは計測用の表示です（?bench）。</b>本番は <a href="./">こちら</a>。
-      ソースで「カメラ」を選び、画面を消さずに 1 分ほど回してください。
-      <b>開始直後と 1 分後の両方</b>を控えます（熱ダレで配分が変わるため）。
-      <br>refine（取り込みと読み戻し。256 の整数倍に丸め）:
-      <a href="?bench&refine=512">512</a> / <a href="?bench&refine=256">256</a>
-      — coeff（ガイデッド係数。2 の冪に丸め）:
-      <a href="?bench&coeff=128">128</a> / <a href="?bench&coeff=256">256</a>
-      <br>depth（同時に投げる枚数）:
-      <a href="?bench&depth=2">2</a> / <a href="?bench&depth=1">1</a>
-      — capture（1枚の渡し方）:
-      <a href="?bench&capture=async">async</a> / <a href="?bench&capture=transfer">transfer</a>
-    </p>
-    <pre id="breakdown">計測待ち…</pre>`);
-  const breakdown = document.getElementById('breakdown');
-  const started = performance.now();
-
-  setInterval(() => {
-    if (!rings.size) return;
-    const total = median(rings.get('分離（呼び出し側）'));
-    breakdown.textContent =
-      `取り込み ${segmenter.maskSize}² / 係数 ${segmenter.coeffSize}² / depth ${DEPTH}`
-      + ` / capture ${SEGMENTER_OPTIONS.captureMode}`
-      + ` / 経過 ${((performance.now() - started) / 1000).toFixed(0)} 秒\n`
-      + [...rings].map(([k, a]) => {
-        const ms = median(a);
-        const pct = k.startsWith('分離') || k.startsWith('合計')
-          ? '' : `  ${((ms / total) * 100).toFixed(1).padStart(5)} %`;
-        return `  ${pad(k === '合計' ? 'Worker 内の合計' : k, 26)}${ms.toFixed(1).padStart(6)} ms${pct}`;
-      }).join('\n');
-  }, 1000);
 }
 
 // --- ソース切替 ---
@@ -334,7 +212,6 @@ async function selectSource(i) {
   const s = SOURCES[i];
 
   loopId++;                                    // 走っているループをまず止める
-  display = null;                              // 縦横比が変わるので前の対は捨てる
   video.srcObject?.getTracks().forEach((t) => t.stop());
   video.srcObject = null;
   video.removeAttribute('src');
@@ -358,8 +235,7 @@ async function selectSource(i) {
     await video.play().catch(() => {});
   }
 
-  stats.textContent = '—';
-  accDraw = 0; nDraw = 0; segCount = 0; lastStats = performance.now();
+  stats.textContent = '—'; accSeg = accAll = n = 0;
   startLoop();
 }
 
@@ -377,7 +253,6 @@ try {
   selectSource(0);
 } catch (err) {
   console.error(err);
-  fatal = true;
   stats.textContent = `モデルを読み込めませんでした: ${err.message}`;
 }
 </script>

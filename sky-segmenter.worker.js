@@ -11,7 +11,7 @@
  *
  * sky-segmenter.js からだけ使われる。プロトコルは 2 種類:
  *   { type:'init',  cfg }               → { type:'ready', inputSize, maskSize }
- *   { type:'frame', bitmap, out }       → { type:'mask', width, height, data, timings }
+ *   { type:'frame', bitmap, out }       → { type:'mask', width, height, data }
  * out は前のフレームで返した Float32Array。転送で返してもらって使い回す
  * （毎フレーム確保すると 1 フレーム 7MB 近いゴミになる）。
  */
@@ -47,7 +47,6 @@ const buf = (key, len) => {
 // session.run を待っている間に次のメッセージが割り込んで、共有している
 // 作業用バッファを壊す（呼び出し側が 2 枚以上同時に投げられるため）。
 let chain = Promise.resolve();
-let lastEnd = 0; // 前の 1 枚を終えた時刻。次が来るまでの空き時間を測る
 
 self.onmessage = (e) => {
   const msg = e.data;
@@ -101,21 +100,12 @@ async function init(options, id) {
 }
 
 async function frame({ id, bitmap, out }) {
-  const timings = {};
-  let t = performance.now();
-  // 前の 1 枚を終えてから次が届くまでの空き。ここが大きいと、Worker は
-  // 仕事を待って遊んでいる＝呼び出し側の往復がボトルネックということ。
-  timings['Worker の空き'] = lastEnd ? t - lastEnd : 0;
-  const mk = (k) => { timings[k] = performance.now() - t; t = performance.now(); };
-  const whole = performance.now();
 
   // 1. 受け取ったビットマップを取り込む（呼び出し側で capture×capture に
   //    潰してあるので、ここは等倍のコピー）
   ctx.drawImage(bitmap, 0, 0, capture, capture);
   bitmap.close();
-  mk('drawImage');
   const { data: rgba } = ctx.getImageData(0, 0, capture, capture);
-  mk('getImageData');
 
   // 2. pool×pool の面積平均でモデル入力サイズへ縮小しつつ、NCHW / 正規化 /
   //    低解像度ガイドを同時に作る。proxy=false なので input も使い回せる
@@ -146,13 +136,11 @@ async function frame({ id, bitmap, out }) {
       guideLo[i] = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
     }
   }
-  mk('縮小と正規化');
 
   // 4. 推論。出力は低解像度のロジット
   const outputs = await session.run({
     [inputName]: new ort.Tensor('float32', input, [1, 3, size, size]),
   });
-  mk('推論');
   const logits = outputs[outputName];
   const [, numClasses, h, w] = logits.dims;
   const values = logits.data;
@@ -176,13 +164,10 @@ async function frame({ id, bitmap, out }) {
       coarse[i] = 1 / (1 + Math.exp(other - sky + cfg.skyMargin));
     }
   }
-  mk('sigmoid');
 
   if (!cfg.refineRadius) {
     const flat = sharpen(coarse, cfg.edgeSharpness, take(out, area));
-    timings['合計'] = performance.now() - whole;
-    lastEnd = performance.now();
-    self.postMessage({ type: 'mask', id, width: w, height: h, data: flat, timings }, [flat.buffer]);
+    self.postMessage({ type: 'mask', id, width: w, height: h, data: flat }, [flat.buffer]);
     return;
   }
 
@@ -238,11 +223,7 @@ async function frame({ id, bitmap, out }) {
       mask[i] = v < 0 ? 0 : v > 1 ? 1 : v;
     }
   }
-  mk('ガイデッドフィルタ');
-  timings['合計'] = performance.now() - whole;
-  lastEnd = performance.now();
-
-  self.postMessage({ type: 'mask', id, width: capture, height: capture, data: mask, timings }, [mask.buffer]);
+  self.postMessage({ type: 'mask', id, width: capture, height: capture, data: mask }, [mask.buffer]);
 }
 
 // coeffSize → capture の拡大で使う、位置と重みの表（bilinear() と同じ式）
