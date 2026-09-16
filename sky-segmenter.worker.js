@@ -27,8 +27,12 @@ let outputName = '';
 let size = 0; // モデル入力の一辺
 let pool = 1; // 何画素を 1 画素に畳むか
 let capture = 0; // 取り込み解像度 = size * pool
+let coeffSize = 0; // ガイデッドフィルタの係数を求める解像度
+let coeffRadius = 1; // その解像度での半径
+let shrink = 1; // size / coeffSize
 let ctx = null;
 let guideLo = null;
+let guideCo = null;
 
 // 作業用バッファ。毎フレーム確保するとモバイルで GC が時々 1 フレーム分の
 // 時間を丸ごと奪う。Worker 側に置けるものは全部ここで 1 回だけ取る。
@@ -71,12 +75,21 @@ async function init(options, id) {
   pool = Math.max(1, Math.round(cfg.refineSize / size));
   capture = size * pool;
 
+  // ガイデッドフィルタの係数 a, b を求める解像度。a, b は元画像より滑らかなので、
+  // 粗く求めて拡大しても品質がほとんど落ちない（fast guided filter の肝）。
+  // 論文の推奨は入力に対して 1/4（= 128）。2 の冪に丸めて size を割り切らせる。
+  shrink = 2 ** Math.max(0, Math.round(Math.log2(size / Math.max(1, cfg.coeffSize))));
+  coeffSize = Math.max(1, size / shrink);
+  // 半径は画像上の大きさを保つ（係数解像度に合わせて縮める）
+  coeffRadius = Math.max(1, Math.round(cfg.refineRadius / shrink));
+
   const canvas = new OffscreenCanvas(capture, capture);
   ctx = canvas.getContext('2d', { willReadFrequently: true });
   guideLo = new Float32Array(size * size); // 統計量計算用に縮小した輝度
+  guideCo = shrink === 1 ? guideLo : new Float32Array(coeffSize * coeffSize);
   buildUpscaleTable();
 
-  self.postMessage({ type: 'ready', id, inputSize: size, maskSize: capture });
+  self.postMessage({ type: 'ready', id, inputSize: size, maskSize: capture, coeffSize });
 }
 
 async function frame({ id, bitmap, out }) {
@@ -165,8 +178,25 @@ async function frame({ id, bitmap, out }) {
   //    線形係数 a, b は低解像度（inputSize）で求め、それを拡大して
   //    高解像度のガイドに当てる。box filter の計算量は据え置きのまま、
   //    輪郭だけ capture の解像度で吸着する（He et al. 2010 の 4.1 節）。
-  const pLo = bilinear(coarse, w, h, size, buf('pLo', size * size));
-  const { a, b } = guidedCoeffs(guideLo, pLo, size, cfg.refineRadius, cfg.refineEps, buf);
+  // 係数解像度の輝度ガイド。shrink×shrink の箱平均で作る（shrink=1 ならそのまま）
+  if (shrink !== 1) {
+    const inv = 1 / (shrink * shrink);
+    for (let y = 0; y < coeffSize; y++) {
+      for (let x = 0; x < coeffSize; x++) {
+        let sum = 0;
+        for (let dy = 0; dy < shrink; dy++) {
+          const row = (y * shrink + dy) * size + x * shrink;
+          for (let dx = 0; dx < shrink; dx++) sum += guideLo[row + dx];
+        }
+        guideCo[y * coeffSize + x] = sum * inv;
+      }
+    }
+  }
+  // モデル出力がちょうど係数解像度なら、拡大せずそのまま使える（既定はこの経路）
+  const pCo = w === coeffSize && h === coeffSize
+    ? coarse
+    : bilinear(coarse, w, h, coeffSize, buf('pCo', coeffSize * coeffSize));
+  const { a, b } = guidedCoeffs(guideCo, pCo, coeffSize, coeffRadius, cfg.refineEps, buf);
 
   // a, b の拡大・輝度ガイド・合成を 1 パスにまとめる。素直に書くと
   // aHi / bHi / guideHi という 512×512 の配列を 3 本書いて読み直すことになり、
@@ -176,8 +206,8 @@ async function frame({ id, bitmap, out }) {
   const mask = take(out, capture * capture);
   const k = cfg.edgeSharpness;
   for (let y = 0, i = 0; y < capture; y++) {
-    const y0 = upY0[y] * size;
-    const y1 = upY1[y] * size;
+    const y0 = upY0[y] * coeffSize;
+    const y1 = upY1[y] * coeffSize;
     const wy = upWy[y];
     for (let x = 0; x < capture; x++, i++) {
       const x0 = upX0[x];
@@ -202,17 +232,17 @@ async function frame({ id, bitmap, out }) {
   self.postMessage({ type: 'mask', id, width: capture, height: capture, data: mask, timings }, [mask.buffer]);
 }
 
-// size → capture の拡大で使う、位置と重みの表（bilinear() と同じ式）
+// coeffSize → capture の拡大で使う、位置と重みの表（bilinear() と同じ式）
 let upX0 = null; let upX1 = null; let upWx = null;
 let upY0 = null; let upY1 = null; let upWy = null;
 function buildUpscaleTable() {
-  const s = size / capture;
+  const s = coeffSize / capture;
   upX0 = new Int32Array(capture); upX1 = new Int32Array(capture); upWx = new Float64Array(capture);
   upY0 = new Int32Array(capture); upY1 = new Int32Array(capture); upWy = new Float64Array(capture);
   for (let i = 0; i < capture; i++) {
-    const f = Math.min((i + 0.5) * s - 0.5, size - 1);
+    const f = Math.min((i + 0.5) * s - 0.5, coeffSize - 1);
     const i0 = Math.max(0, Math.floor(f));
-    const i1 = Math.min(i0 + 1, size - 1);
+    const i1 = Math.min(i0 + 1, coeffSize - 1);
     upX0[i] = upY0[i] = i0;
     upX1[i] = upY1[i] = i1;
     upWx[i] = upWy[i] = f - i0;

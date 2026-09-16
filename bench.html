@@ -52,11 +52,11 @@
   <b>これは計測用のページです。</b>本番は <a href="./">index.html</a>。
   ソースで「カメラ」を選び、画面を消さずに 1 分ほど回してください。
   <b>開始直後と 1 分後の両方</b>を控えます（熱ダレで配分が変わるため）。
-  <br>refineSize:
-  <a href="?refine=512">512（現行）</a> /
-  <a href="?refine=256">256</a>
-  — 取り込みも読み戻しもこの解像度で行います。<b>inputSize (256) の整数倍だけ</b>
-  有効で、それ以外は丸められます（384 は 512 になる）。実際の値は下の行に出ます。
+  <br>refineSize（取り込みと読み戻しの解像度。inputSize 256 の整数倍に丸め）:
+  <a href="?refine=512">512（現行）</a> / <a href="?refine=256">256</a>
+  <br>coeffSize（ガイデッド係数を求める解像度。2 の冪に丸め）:
+  <a href="?coeff=128">128（現行）</a> / <a href="?coeff=256">256</a>
+  <br>実際に効いた値は下の行に出ます。
 </p>
 <pre id="breakdown">計測待ち…</pre>
 
@@ -85,11 +85,14 @@ const SOURCES = [
 // （出力は 128×128 のロジット）で、それをガイデッドフィルタで refineSize まで
 // 起こしたものがマスクになる。SkyMaskCV の PROC_PIXELS に相当するつまみはここ。
 // 入力が正方形固定なので縦横比は一度潰し、マスクを元の縦横比へ引き伸ばして戻す。
-// 計測版は refineSize を ?refine= で切り替えられる。
-const REFINE = Number(new URLSearchParams(location.search).get('refine')) || 512;
+// 計測版は ?refine= と ?coeff= で切り替えられる。
+const params = new URLSearchParams(location.search);
+const REFINE = Number(params.get('refine')) || 512;
+const COEFF = Number(params.get('coeff')) || 128;
 const SEGMENTER_OPTIONS = {
   modelUrl: './models/tinyskynet_skyseg_256.onnx',
   refineSize: REFINE,
+  coeffSize: COEFF,
 };
 
 const video = document.getElementById('video');
@@ -294,7 +297,7 @@ setInterval(() => {
     return `  ${pad(k, 26)}${ms.toFixed(1).padStart(6)} ms${pct}`;
   });
   breakdown.textContent =
-    `取り込み ${segmenter?.maskSize ?? '?'}×${segmenter?.maskSize ?? '?'}（refineSize=${REFINE} の指定）`
+    `取り込み ${segmenter?.maskSize ?? '?'}² / 係数 ${segmenter?.coeffSize ?? '?'}²`
     + ` / 経過 ${((performance.now() - t0) / 1000).toFixed(0)} 秒`
     + ` / 直近 ${rings.get('分離（呼び出し側の計測）').length} フレームの中央値\n`
     + rows.join('\n');

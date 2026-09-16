@@ -30,6 +30,11 @@ export const SKY_SEGMENTER_DEFAULTS = {
   // マスクの境界を被写体の輪郭へ吸着させる（0 にすると無効）。
   refineRadius: 4, // ガイデッドフィルタの半径（inputSize 上の画素数）
   refineEps: 1e-4,
+  // 係数 a, b を求める解像度。a, b は元画像より滑らかなので、粗く求めて拡大しても
+  // 品質がほとんど落ちない（fast guided filter の肝で、論文の推奨は入力の 1/4）。
+  // モデル出力がちょうど 128×128 なので、128 にすると拡大そのものも要らなくなる。
+  // 2 の冪に丸められる。実際の値は生成後に coeffSize で確認できる。
+  coeffSize: 128,
   // 出力マスクの解像度。inputSize の整数倍に丸められる（384 を渡せば 512 になる）。
   // ここを上げるほど輪郭がシャープになるが、取り込みと読み戻しもこの解像度で
   // 行う。実際の値は生成後に maskSize で確認できる。
@@ -109,6 +114,7 @@ export async function createSkySegmenter(options = {}) {
     segment,
     inputSize: ready.inputSize,
     maskSize: ready.maskSize,
+    coeffSize: ready.coeffSize,
     dispose: () => worker.terminate(),
   };
 }
