@@ -28,7 +28,6 @@ let size = 0; // モデル入力の一辺
 let pool = 1; // 何画素を 1 画素に畳むか
 let capture = 0; // 取り込み解像度 = size * pool
 let ctx = null;
-let guideHi = null;
 let guideLo = null;
 
 // 作業用バッファ。毎フレーム確保するとモバイルで GC が時々 1 フレーム分の
@@ -74,8 +73,8 @@ async function init(options, id) {
 
   const canvas = new OffscreenCanvas(capture, capture);
   ctx = canvas.getContext('2d', { willReadFrequently: true });
-  guideHi = new Float32Array(capture * capture); // 高解像度の輝度ガイド
   guideLo = new Float32Array(size * size); // 統計量計算用に縮小した輝度
+  buildUpscaleTable();
 
   self.postMessage({ type: 'ready', id, inputSize: size, maskSize: capture });
 }
@@ -125,12 +124,6 @@ async function frame({ id, bitmap, out }) {
   }
   mk('縮小と正規化');
 
-  // 3. 高解像度のガイド（輝度）。輪郭の細さはここの解像度で決まる
-  for (let i = 0, p = 0; i < guideHi.length; i++, p += 4) {
-    guideHi[i] = (rgba[p] * 0.299 + rgba[p + 1] * 0.587 + rgba[p + 2] * 0.114) / 255;
-  }
-  mk('高解像度ガイド');
-
   // 4. 推論。出力は低解像度のロジット
   const outputs = await session.run({
     [inputName]: new ort.Tensor('float32', input, [1, 3, size, size]),
@@ -174,20 +167,56 @@ async function frame({ id, bitmap, out }) {
   //    輪郭だけ capture の解像度で吸着する（He et al. 2010 の 4.1 節）。
   const pLo = bilinear(coarse, w, h, size, buf('pLo', size * size));
   const { a, b } = guidedCoeffs(guideLo, pLo, size, cfg.refineRadius, cfg.refineEps, buf);
-  const aHi = bilinear(a, size, size, capture, buf('aHi', capture * capture));
-  const bHi = bilinear(b, size, size, capture, buf('bHi', capture * capture));
 
-  // 返す配列だけは転送で手放すので、前のフレームで返ってきたものを受け取って使う
-  const mask = take(out, guideHi.length);
+  // a, b の拡大・輝度ガイド・合成を 1 パスにまとめる。素直に書くと
+  // aHi / bHi / guideHi という 512×512 の配列を 3 本書いて読み直すことになり、
+  // 実機（熱ダレ後）ではここが 15ms かかっていた。式は同じで、
+  // 途中の配列を作らないだけ（出力はビット単位で一致する）。
+  // 拡大の重みは x 方向・y 方向とも位置だけで決まるので、表にして使い回す。
+  const mask = take(out, capture * capture);
   const k = cfg.edgeSharpness;
-  for (let i = 0; i < mask.length; i++) {
-    const v = (aHi[i] * guideHi[i] + bHi[i] - 0.5) * k + 0.5;
-    mask[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+  for (let y = 0, i = 0; y < capture; y++) {
+    const y0 = upY0[y] * size;
+    const y1 = upY1[y] * size;
+    const wy = upWy[y];
+    for (let x = 0; x < capture; x++, i++) {
+      const x0 = upX0[x];
+      const x1 = upX1[x];
+      const wx = upWx[x];
+      // a を拡大
+      const a0 = a[y0 + x0] * (1 - wx) + a[y0 + x1] * wx;
+      const a1 = a[y1 + x0] * (1 - wx) + a[y1 + x1] * wx;
+      // b を拡大
+      const b0 = b[y0 + x0] * (1 - wx) + b[y0 + x1] * wx;
+      const b1 = b[y1 + x0] * (1 - wx) + b[y1 + x1] * wx;
+      // 輝度ガイド（ここでしか使わないので配列にしない）
+      const p = i * 4;
+      const g = (rgba[p] * 0.299 + rgba[p + 1] * 0.587 + rgba[p + 2] * 0.114) / 255;
+      const v = ((a0 * (1 - wy) + a1 * wy) * g + (b0 * (1 - wy) + b1 * wy) - 0.5) * k + 0.5;
+      mask[i] = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
   }
   mk('ガイデッドフィルタ');
   timings['合計'] = performance.now() - whole;
 
   self.postMessage({ type: 'mask', id, width: capture, height: capture, data: mask, timings }, [mask.buffer]);
+}
+
+// size → capture の拡大で使う、位置と重みの表（bilinear() と同じ式）
+let upX0 = null; let upX1 = null; let upWx = null;
+let upY0 = null; let upY1 = null; let upWy = null;
+function buildUpscaleTable() {
+  const s = size / capture;
+  upX0 = new Int32Array(capture); upX1 = new Int32Array(capture); upWx = new Float64Array(capture);
+  upY0 = new Int32Array(capture); upY1 = new Int32Array(capture); upWy = new Float64Array(capture);
+  for (let i = 0; i < capture; i++) {
+    const f = Math.min((i + 0.5) * s - 0.5, size - 1);
+    const i0 = Math.max(0, Math.floor(f));
+    const i1 = Math.min(i0 + 1, size - 1);
+    upX0[i] = upY0[i] = i0;
+    upX1[i] = upY1[i] = i1;
+    upWx[i] = upWy[i] = f - i0;
+  }
 }
 
 /** 返ってきたバッファが使えればそれを、駄目なら新しく確保する */
