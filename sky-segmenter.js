@@ -50,7 +50,7 @@ export const SKY_SEGMENTER_DEFAULTS = {
 export async function createSkySegmenter(options = {}) {
   const cfg = { ...SKY_SEGMENTER_DEFAULTS, ...options };
   // ?v= は index.html 側と揃える（古いキャッシュとの食い違いを防ぐ）
-  const worker = new Worker(new URL('./sky-segmenter.worker.js?v=4', import.meta.url), {
+  const worker = new Worker(new URL('./sky-segmenter.worker.js?v=5', import.meta.url), {
     type: 'module',
   });
 

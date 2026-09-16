@@ -4,6 +4,8 @@
 分離は 199KB の CNN（`tinyskynet_skyseg_256.onnx`）を onnxruntime-web で回します。
 
 **デモ**: https://kisakutanaka.github.io/SkyMaskCNN/
+**ステップ解説**: https://kisakutanaka.github.io/SkyMaskCNN/steps.html
+（1 枚が空マスクになるまでを、実際に計算しながら 1 段ずつ画像で見せるページ）
 
 **画面と合成は [SkyMaskCV](https://github.com/kisakutanaka/SkyMaskCV) と同じもので、
 背景分離の中身だけを差し替えてあります。** 古典CV と CNN を同じ入力・同じ表示・
@@ -129,12 +131,19 @@ wasm は GitHub Pages が COOP/COEP ヘッダを付けられない = SharedArray
 
 | ファイル | 役割 |
 |---|---|
-| `index.html` | 画面・ループ・合成。SkyMaskCV とは分離の呼び出しだけが違う |
+| `sky-mask.js` | **計算そのもの**。DOM も Worker も ONNX も知らない純粋関数だけ |
+| `sky-segmenter.worker.js` | Worker の配管。ONNX セッションと取り込み。計算は上に任せる |
 | `sky-segmenter.js` | 公開 API（メインスレッド側）。取り込みと Worker とのやりとりだけ |
-| `sky-segmenter.worker.js` | 読み戻し・正規化・推論・ガイデッドフィルタ。ort もここが読む |
+| `index.html` | 画面・ループ・合成。SkyMaskCV とは分離の呼び出しだけが違う |
+| `steps.html` | ステップ解説。同じ関数を同じ順で呼び直して 1 段ずつ表示する |
 | `models/` | 同梱モデルと、その出所・ライセンス（[models/README.md](models/README.md)）|
 
-`sky-segmenter.js` と `sky-segmenter.worker.js` は 2 つで 1 組で、そのままコピーすれば
+計算と配管を分けてあるので、[steps.html](steps.html) は本番と同じ関数を呼び直して
+途中経過を出せます。**説明用に式を書き直すと実物とずれていくので、最後に
+`sky-segmenter.js`（本番の経路）の出力と突き合わせ、1 画素も違わないことを
+ページ上で確かめます**（隣の SkyMaskCV の `tools/steps.mjs` と同じ規律）。
+
+`sky-segmenter.js` / `sky-segmenter.worker.js` / `sky-mask.js` の 3 つで 1 組で、そのままコピーすれば
 他プロジェクトでも動きます（元は[隣の SkySegmentation](https://github.com/kisakutanaka/SkySegmentation)
 の 1 ファイル版）。module worker と OffscreenCanvas が要ります（Safari 16.4+ / Chrome 69+）。
 モデルの学習・評価コードもそちらにあります。

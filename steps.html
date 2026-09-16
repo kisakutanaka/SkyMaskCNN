@@ -1,0 +1,401 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SkyMaskCNN のステップ解説</title>
+<style>
+  :root { --bg: #111; --card: #191919; --line: #2c2c2c; }
+  body { margin: 0; background: var(--bg); color: #ddd;
+    font: 14px/1.7 system-ui, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px 16px 64px; }
+  h1 { font-size: 18px; margin: 8px 0 4px; }
+  .lead { color: #999; font-size: 13px; margin: 0 0 16px; }
+  .lead a { color: #8ad; }
+  header.bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    padding: 8px 0 16px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+  select, button, input[type=file] { font: inherit; padding: 4px 8px; }
+  #verdict { font-size: 13px; padding: 10px 12px; border-radius: 6px;
+    background: #14251a; color: #7c7; border: 1px solid #2a4a33; margin: 16px 0 0; }
+  #verdict.ng { background: #2a1616; color: #e88; border-color: #5a2a2a; }
+  .step { border-top: 1px solid var(--line); padding: 20px 0 4px; }
+  .step h2 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+  .step h2 .no { color: #6a9; font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .step .meta { color: #888; font-size: 12px; font-variant-numeric: tabular-nums;
+    margin: 0 0 8px; }
+  .step p { margin: 0 0 10px; color: #bbb; }
+  .step p b { color: #eee; }
+  .shots { display: flex; gap: 12px; flex-wrap: wrap; }
+  figure { margin: 0; }
+  figcaption { color: #888; font-size: 12px; margin-top: 4px; }
+  canvas { display: block; background: #000; border: 1px solid var(--line);
+    image-rendering: pixelated; max-width: 100%; height: auto; }
+  code { background: #222; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .wait { color: #ca8; }
+</style>
+
+<main>
+  <h1>SkyMaskCNN のステップ解説</h1>
+  <p class="lead">
+    1 枚の画像が空マスクになるまでを、実際に計算しながら 1 段ずつ表示します。
+    使っているのは本番と同じ <code>sky-mask.js</code> の関数と同じモデルです。
+    最後に <code>sky-segmenter.js</code>（＝本番の経路）の出力と突き合わせ、
+    一致することを確かめます（説明用に書き直した式がずれていないことの担保）。
+    本番のデモは <a href="./">index.html</a>。
+  </p>
+
+  <header class="bar">
+    <select id="source"></select>
+    <input type="file" id="file" accept="image/*">
+    <span id="status" class="wait">モデルを読み込んでいます…</span>
+  </header>
+
+  <div id="steps"></div>
+  <p id="verdict" hidden></p>
+</main>
+
+<script type="module">
+import {
+  bilinear, guidedCoeffs, plan, refine, shrinkGuide, toInput, toProbability, upscaleTable,
+} from './sky-mask.js?v=5';
+import { createSkySegmenter, SKY_SEGMENTER_DEFAULTS } from './sky-segmenter.js?v=5';
+
+const cfg = { ...SKY_SEGMENTER_DEFAULTS, modelUrl: './models/tinyskynet_skyseg_256.onnx' };
+const { size, capture, coeffSize, coeffRadius, shrink } = plan(cfg);
+
+const SOURCES = [
+  { label: '曇天 01', src: 'img/cloudy01.png' },
+  { label: '曇天 02', src: 'img/cloudy02.png' },
+];
+
+const statusEl = document.getElementById('status');
+const stepsEl = document.getElementById('steps');
+const verdictEl = document.getElementById('verdict');
+
+// --- 表示用のこまごま ---------------------------------------------------
+
+/** 0..1 の配列をグレースケールで描く */
+function drawUnit(data, w, h, scale = 1) {
+  return paint(w, h, scale, (px) => {
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.max(0, Math.min(1, data[i])) * 255;
+      px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = v;
+      px[i * 4 + 3] = 255;
+    }
+  });
+}
+
+/** 正負のある配列を 青(-) 黒(0) 赤(+) で描く。範囲は自動で取る */
+function drawSigned(data, w, h, scale = 1) {
+  let m = 0;
+  for (const v of data) if (Number.isFinite(v)) m = Math.max(m, Math.abs(v));
+  return paint(w, h, scale, (px) => {
+    for (let i = 0; i < data.length; i++) {
+      const t = m ? data[i] / m : 0;
+      px[i * 4] = t > 0 ? t * 255 : 0;
+      px[i * 4 + 1] = 0;
+      px[i * 4 + 2] = t < 0 ? -t * 255 : 0;
+      px[i * 4 + 3] = 255;
+    }
+  });
+}
+
+/** RGBA をそのまま描く */
+function drawRgba(rgba, w, h, scale = 1) {
+  return paint(w, h, scale, (px) => px.set(rgba));
+}
+
+function paint(w, h, scale, fill) {
+  const src = document.createElement('canvas');
+  src.width = w; src.height = h;
+  const img = src.getContext('2d').createImageData(w, h);
+  fill(img.data);
+  src.getContext('2d').putImageData(img, 0, 0);
+  if (scale === 1) return src;
+  const dst = document.createElement('canvas');
+  dst.width = w * scale; dst.height = h * scale;
+  const c = dst.getContext('2d');
+  c.imageSmoothingEnabled = false;
+  c.drawImage(src, 0, 0, dst.width, dst.height);
+  return dst;
+}
+
+/** 配列の範囲を「最小 / 中央 / 最大」で読む */
+function range(data) {
+  const s = Float64Array.from(data).sort();
+  const f = (v) => (Math.abs(v) < 10 ? v.toFixed(3) : v.toFixed(1));
+  return `${f(s[0])} 〜 ${f(s[s.length >> 1])} 〜 ${f(s[s.length - 1])}`;
+}
+
+let stepNo = 0;
+function step({ title, meta, why, shots }) {
+  const el = document.createElement('section');
+  el.className = 'step';
+  el.innerHTML = `<h2><span class="no">${String(++stepNo).padStart(2, '0')}</span>${title}</h2>`
+    + (meta ? `<p class="meta">${meta}</p>` : '')
+    + `<p>${why}</p><div class="shots"></div>`;
+  const row = el.querySelector('.shots');
+  for (const [caption, canvas] of shots) {
+    const fig = document.createElement('figure');
+    fig.append(canvas);
+    const cap = document.createElement('figcaption');
+    cap.textContent = caption;
+    fig.append(cap);
+    row.append(fig);
+  }
+  stepsEl.append(el);
+}
+
+// --- 本編 ---------------------------------------------------------------
+
+const segmenter = await createSkySegmenter(cfg);   // 突き合わせ用（本番の経路）
+const ort = await import(cfg.ortUrl);              // 説明用に手元でも推論する
+ort.env.wasm.wasmPaths = cfg.ortWasmPaths;
+ort.env.wasm.numThreads = 1;
+ort.env.wasm.proxy = false;
+const session = await ort.InferenceSession.create(cfg.modelUrl, {
+  executionProviders: ['wasm'], graphOptimizationLevel: 'all',
+});
+
+async function run(img) {
+  stepsEl.textContent = '';
+  verdictEl.hidden = true;
+  stepNo = 0;
+  statusEl.textContent = '計算しています…';
+  await new Promise((r) => requestAnimationFrame(r));
+
+  // 01 入力
+  const shown = document.createElement('canvas');
+  const fit = Math.min(1, 420 / img.naturalWidth);
+  shown.width = Math.round(img.naturalWidth * fit);
+  shown.height = Math.round(img.naturalHeight * fit);
+  shown.getContext('2d').drawImage(img, 0, 0, shown.width, shown.height);
+  step({
+    title: '入力',
+    meta: `${img.naturalWidth} × ${img.naturalHeight}`,
+    why: 'カメラでも静止画でも、ここから先は同じ扱いになります。',
+    shots: [['元画像', shown]],
+  });
+
+  // 02 取り込み（正方形に潰す）
+  const cap = document.createElement('canvas');
+  cap.width = cap.height = capture;
+  const capCtx = cap.getContext('2d', { willReadFrequently: true });
+  capCtx.drawImage(img, 0, 0, capture, capture);
+  const { data: rgba } = capCtx.getImageData(0, 0, capture, capture);
+  step({
+    title: `${capture}×${capture} に取り込む`,
+    meta: `${capture} × ${capture} / 縦横比は潰れる`,
+    why: 'モデルの入力が <b>256×256 の正方形固定</b>なので、縦横比はここで一度潰します。'
+       + 'マスクを使うときに元の縦横比へ引き伸ばして戻すので、位置はずれません。'
+       + `取り込みを ${capture} にしているのは、輪郭を吸着させる段（07）をこの解像度で`
+       + '行うためです。本番ではこの 1 枚を Worker へ渡し、'
+       + '読み戻し（<code>getImageData</code>）も Worker 側で行います。',
+    shots: [['取り込んだ1枚', drawRgba(rgba, capture, capture, 420 / capture)]],
+  });
+
+  // 03 モデル入力と輝度ガイド
+  const input = new Float32Array(3 * size * size);
+  const guideLo = new Float32Array(size * size);
+  toInput(rgba, capture, size, input, guideLo);
+  const pool = capture / size;
+  const rgbSmall = new Uint8ClampedArray(size * size * 4);
+  for (let i = 0; i < size * size; i++) {
+    for (let c = 0; c < 3; c++) {
+      rgbSmall[i * 4 + c] = (input[i + c * size * size] * STD[c] + MEAN[c]) * 255;
+    }
+    rgbSmall[i * 4 + 3] = 255;
+  }
+  step({
+    title: `${pool}×${pool} の面積平均で ${size}×${size} へ縮小し、正規化する`,
+    meta: `モデル入力 [1, 3, ${size}, ${size}] / 値の範囲 ${range(input)}`,
+    why: '単純な間引きではなく面積平均で縮めます（細い構造が消えにくい）。'
+       + '同時に ImageNet の平均・分散で正規化します（学習時と同じ前処理でないと当たりません）。'
+       + '<b>輝度ガイド</b>もこのループで一緒に作ります。あとでマスクの輪郭を'
+       + '被写体の縁へ吸着させるとき、この明るさの変化が手がかりになります。',
+    shots: [
+      ['モデルが見る絵（正規化を戻したもの）', drawRgba(rgbSmall, size, size, 256 / size)],
+      ['輝度ガイド', drawUnit(guideLo, size, size, 256 / size)],
+    ],
+  });
+
+  // 04 推論
+  const t0 = performance.now();
+  const outputs = await session.run({
+    [session.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, size, size]),
+  });
+  const inferMs = performance.now() - t0;
+  const logits = outputs[session.outputNames[0]];
+  const [, numClasses, h, w] = logits.dims;
+  step({
+    title: 'CNN 推論',
+    meta: `出力 [1, ${numClasses}, ${h}, ${w}] / 値の範囲 ${range(logits.data)} / ${inferMs.toFixed(1)} ms`,
+    why: `モデル (49,233 パラメータ) が返すのは <b>${h}×${w} のロジット</b>です。`
+       + '入力の 1/2、取り込みの 1/4 しかありません。'
+       + '<b>ここを粗いままにしてあるのが設計の要</b>で、輪郭の細かさは後段の'
+       + 'ガイデッドフィルタで出します。モデルを重くせずに済むのはそのためです。'
+       + '赤が「空らしい」、青が「空らしくない」。',
+    shots: [['ロジット', drawSigned(logits.data, w, h, 256 / w)]],
+  });
+
+  // 05 確率へ
+  const area = h * w;
+  const coarse = toProbability(
+    logits.data, numClasses, area, cfg.skyClassIndex, cfg.skyMargin, new Float32Array(area),
+  );
+  step({
+    title: 'sigmoid で「空である確率」にする',
+    meta: `${w} × ${h} / 0..1 / 範囲 ${range(coarse)}`,
+    why: numClasses === 1
+      ? 'このモデルは空/非空の二値なので、ロジットをそのまま sigmoid に通すだけです。'
+      : '「空」対「空以外の最大」の 2 値ソフトマックスにします（全クラスの softmax より安い）。',
+    shots: [['確率', drawUnit(coarse, w, h, 256 / w)]],
+  });
+
+  // 06 係数を求める
+  const guideCo = shrinkGuide(guideLo, size, shrink, new Float32Array(coeffSize * coeffSize));
+  const pCo = w === coeffSize && h === coeffSize
+    ? coarse
+    : bilinear(coarse, w, h, coeffSize, new Float32Array(coeffSize * coeffSize));
+  const { a, b } = guidedCoeffs(guideCo, pCo, coeffSize, coeffRadius, cfg.refineEps);
+  step({
+    title: `ガイデッドフィルタの係数 a, b を ${coeffSize}×${coeffSize} で求める`,
+    meta: `半径 ${coeffRadius} / a の範囲 ${range(a)} / b の範囲 ${range(b)}`,
+    why: 'ねらいは「マスク ≒ <b>a × 輝度 + b</b>」という直線を、狭い窓ごとに当てはめること。'
+       + 'そうするとマスクが輝度の変化に沿って動くので、'
+       + '<b>粗い確率が被写体の輪郭に吸い付きます</b>。'
+       + 'a が大きいところは「輝度でよく説明できる＝輪郭がある」ところ、'
+       + 'a が 0 に近いところは「のっぺりしていて輝度では決まらない」ところです。'
+       + `a, b は元画像より滑らかなので、${coeffSize} で求めて拡大しても品質がほとんど`
+       + '落ちません（fast guided filter）。'
+       + `モデル出力がちょうど ${coeffSize}×${coeffSize} なので、拡大せずそのまま渡せます。`,
+    shots: [
+      ['係数 a', drawSigned(a, coeffSize, coeffSize, 256 / coeffSize)],
+      ['係数 b', drawSigned(b, coeffSize, coeffSize, 256 / coeffSize)],
+      ['輝度ガイド（係数解像度）', drawUnit(guideCo, coeffSize, coeffSize, 256 / coeffSize)],
+    ],
+  });
+
+  // 07 拡大して合成
+  const table = upscaleTable(coeffSize, capture);
+  const mask = refine(
+    a, b, rgba, coeffSize, capture, cfg.edgeSharpness, table, new Float32Array(capture * capture),
+  );
+  const naive = bilinear(coarse, w, h, capture, new Float32Array(capture * capture));
+  step({
+    title: `係数を ${capture}×${capture} へ拡大し、輝度を当てて 1 パスで仕上げる`,
+    meta: `${capture} × ${capture} / edgeSharpness ${cfg.edgeSharpness}`,
+    why: `a, b を ${capture} へ引き伸ばし、その解像度の輝度に当てます。`
+       + `<b>粗い確率を ${capture} へ引き伸ばしただけ（左）と見比べてください。</b>`
+       + '同じ情報量から出発しているのに、右はビルの縁で切れています。'
+       + '最後に 0.5 を境にコントラストを立てて（<code>edgeSharpness</code>）遷移帯を狭めます。'
+       + '途中の配列を作らず 1 パスで解いているので、実機でここは 3〜6ms です。',
+    shots: [
+      ['粗い確率をただ拡大したもの', drawUnit(naive, capture, capture, 256 / capture)],
+      ['ガイデッドフィルタ後', drawUnit(mask, capture, capture, 256 / capture)],
+    ],
+  });
+
+  // 08 縁の拡大
+  step({
+    title: '境界を等倍で見る',
+    meta: `${capture} × ${capture} の一部を切り出し / 4倍に拡大`,
+    why: '上の 2 枚の同じ場所を切り出したものです。'
+       + '<b>粗いほうは階段状に、精緻化後はビルの輪郭に沿って</b>切れています。'
+       + 'これが「モデルを 49K パラメータのままにしても使える」理由です。',
+    shots: [
+      ['拡大しただけ', crop(naive, capture, 0.52, 0.40, 96, 4)],
+      ['精緻化後', crop(mask, capture, 0.52, 0.40, 96, 4)],
+      ['元の絵', cropRgba(rgba, capture, 0.52, 0.40, 96, 4)],
+    ],
+  });
+
+  // 09 合成
+  const [vw, vh] = [img.naturalWidth, img.naturalHeight];
+  const maskCv = drawAlpha(mask, capture);
+  const fg = document.createElement('canvas');
+  fg.width = vw; fg.height = vh;
+  const fgCtx = fg.getContext('2d');
+  fgCtx.drawImage(img, 0, 0);
+  fgCtx.globalCompositeOperation = 'destination-out';
+  fgCtx.drawImage(maskCv, 0, 0, vw, vh);
+  const outCv = document.createElement('canvas');
+  outCv.width = Math.round(vw * fit); outCv.height = Math.round(vh * fit);
+  const oc = outCv.getContext('2d');
+  oc.drawImage(img, 0, 0, outCv.width, outCv.height);
+  if (kaiju.complete) {
+    const kh = outCv.height * 0.40;
+    const kw = kh * kaiju.width / kaiju.height;
+    oc.drawImage(kaiju, (outCv.width - kw) / 2, outCv.height * 0.58 - kh, kw, kh);
+  }
+  oc.drawImage(fg, 0, 0, outCv.width, outCv.height);
+  step({
+    title: 'アルファに載せて合成する',
+    meta: `${vw} × ${vh}（表示は縮小）`,
+    why: '確率を <b>そのままアルファ</b>に載せます（0/1 に潰さないので境界がぼけて馴染む）。'
+       + '空を抜いた元映像を最前面に重ねると、間に挟んだ怪獣がビルの背後に回り込みます。'
+       + '正方形のマスクはここで GPU が元の縦横比へ引き伸ばします。',
+    shots: [['合成結果', outCv]],
+  });
+
+  // 一致の検証
+  const truth = await segmenter.segment(img);
+  let maxDiff = 0;
+  for (let i = 0; i < mask.length; i++) maxDiff = Math.max(maxDiff, Math.abs(mask[i] - truth.data[i]));
+  verdictEl.hidden = false;
+  verdictEl.className = maxDiff === 0 ? '' : 'ng';
+  verdictEl.textContent = maxDiff === 0
+    ? `✓ この 9 段の結果は、本番の sky-segmenter.js の出力と 1 画素も違いません（${mask.length} 画素を突き合わせ）。`
+    : `✗ 本番の出力と差があります（最大 ${maxDiff}）。説明用の式がずれています。`;
+  statusEl.textContent = '';
+}
+
+/** マスクの一部を切り出して拡大 */
+function crop(data, w, cx, cy, span, scale) {
+  const x0 = Math.round(w * cx), y0 = Math.round(w * cy);
+  const sub = new Float32Array(span * span);
+  for (let y = 0; y < span; y++) {
+    for (let x = 0; x < span; x++) sub[y * span + x] = data[(y0 + y) * w + (x0 + x)];
+  }
+  return drawUnit(sub, span, span, scale);
+}
+function cropRgba(rgba, w, cx, cy, span, scale) {
+  const x0 = Math.round(w * cx), y0 = Math.round(w * cy);
+  const sub = new Uint8ClampedArray(span * span * 4);
+  for (let y = 0; y < span; y++) {
+    for (let x = 0; x < span; x++) {
+      const s = ((y0 + y) * w + (x0 + x)) * 4, d = (y * span + x) * 4;
+      sub[d] = rgba[s]; sub[d + 1] = rgba[s + 1]; sub[d + 2] = rgba[s + 2]; sub[d + 3] = 255;
+    }
+  }
+  return drawRgba(sub, span, span, scale);
+}
+/** 確率をアルファに載せたキャンバス（空=不透明） */
+function drawAlpha(data, w) {
+  return paint(w, w, 1, (px) => {
+    for (let i = 0; i < data.length; i++) px[i * 4 + 3] = data[i] * 255;
+  });
+}
+
+const MEAN = [0.485, 0.456, 0.406];
+const STD = [0.229, 0.224, 0.225];
+
+const kaiju = new Image();
+kaiju.src = 'kaiju.png';
+
+// --- ソース選択 ---------------------------------------------------------
+const select = document.getElementById('source');
+SOURCES.forEach((s, i) => select.add(new Option(s.label, String(i))));
+select.onchange = () => load(SOURCES[Number(select.value)].src);
+document.getElementById('file').onchange = (e) => {
+  const f = e.target.files?.[0];
+  if (f) load(URL.createObjectURL(f));
+};
+
+async function load(src) {
+  const img = new Image();
+  img.src = src;
+  await img.decode();
+  await run(img);
+}
+
+await load(SOURCES[0].src);
+</script>
