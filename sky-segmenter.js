@@ -101,12 +101,17 @@ export async function createSkySegmenter(options = {}) {
     // 取り込みはここだけ。drawImage は GPU に積むだけで完了を待たず、
     // transferToImageBitmap は中身を持ち出すだけなので、どちらも同期読み戻しを
     // 起こさない。正方形に潰すのもここ（縦横比は呼び出し側が拡大で戻す）。
+    const t0 = performance.now();
     captureCtx.drawImage(source, 0, 0, capture.width, capture.height);
     const bitmap = capture.transferToImageBitmap();
     const transfer = [bitmap];
     if (spare) transfer.push(spare.buffer);
+    const sync = performance.now() - t0;
     const res = await ask({ type: 'frame', bitmap, out: spare }, transfer);
     spare = res.data;
+    // 取り込みと往復も内訳に混ぜる。Worker 内の合計との差がここに出る。
+    res.timings['取り込み(メイン)'] = sync;
+    res.timings['往復と待ち'] = performance.now() - t0 - sync - res.timings['合計'];
     return res;
   }
 

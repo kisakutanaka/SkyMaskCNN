@@ -229,6 +229,8 @@ let loopId = 0;
 function startLoop() {
   const id = ++loopId;
   (async () => {
+    let mask = null;                           // 1 つ前の結果
+    let shot = null;                           // そのマスクを作った元のフレーム
     while (id === loopId) {
       const [vw, vh] = sizeOf(active);
       if (!segmenter || !vw) {                 // 準備前、または寸法がまだ来ていない
@@ -236,18 +238,34 @@ function startLoop() {
         continue;
       }
 
-      // 分離に渡すフレームを、同じ同期ブロックの中で控える。segment() の中の
-      // 取り込み（drawImage）も await より手前で走るので、両者は必ず同じ1枚を見る。
-      const shot = shots[shotIdx];
-      if (shot.el.width !== vw || shot.el.height !== vh) {
-        shot.el.width = vw; shot.el.height = vh;
-      }
-      shot.ctx.drawImage(active, 0, 0, vw, vh);
+      // --- 1. 前のマスクをアルファへ焼く ---
+      // 次の segment() でこのバッファは Worker へ返す（転送で手放す）ので、
+      // それより先に使い切っておく。
+      if (mask) updateMask(mask);
 
+      // --- 2. 次のフレームを投げる ---
+      // 控えは同じ同期ブロックで撮る。segment() の中の取り込み（drawImage）も
+      // await より手前で走るので、両者は必ず同じ1枚を見る。
+      const next = shots[shotIdx];
+      shotIdx ^= 1;                            // 表示中の1枚を潰さないよう2枚で回す
+      if (next.el.width !== vw || next.el.height !== vh) {
+        next.el.width = vw; next.el.height = vh;
+      }
+      next.ctx.drawImage(active, 0, 0, vw, vh);
       const t0 = performance.now();
-      let mask;
+      const pending = segmenter.segment(active);
+
+      // --- 3. Worker が推論している間に、前の対を合成する ---
+      // await のあとに置くと、メインスレッドの GPU 仕事と Worker が直列に並ぶ。
+      // 実機ではそれで 1 枚 50ms のうち 24ms が Worker の外に出ていた。
+      if (mask) {
+        display = shot;                        // ここで対が揃う
+        renderFrame();
+      }
+
+      // --- 4. 待つ ---
       try {
-        mask = await segmenter.segment(active);
+        mask = await pending;
       } catch (err) {
         console.error(err);
         fatal = true;
@@ -255,14 +273,11 @@ function startLoop() {
         return;
       }
       if (id !== loopId) return;               // await の間に切り替わっていたら捨てる
+      shot = next;
       segMs = performance.now() - t0;
       segCount++;
       lastTimings = mask.timings;              // 工程別の内訳（bench.html が読む）
       pushTimings(segMs, mask.timings);        // ← 計測版だけ
-      updateMask(mask);
-      display = shot;                          // ここで対が揃う
-      shotIdx ^= 1;                            // 次の分離は空いている方へ描く
-      renderFrame();
     }
   })();
 }
