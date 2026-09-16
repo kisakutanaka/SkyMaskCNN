@@ -2,13 +2,17 @@
  * sky-segmenter.js
  *
  * カメラ映像 / 画像から「空である確率マップ」だけを返す最小モジュール。
- * 依存はグローバルの `ort` (onnxruntime-web) だけなので、このファイルを
- * そのままコピーすれば他プロジェクトでも動きます。
+ * 分離は丸ごと Worker (sky-segmenter.worker.js) で走る。メインスレッドに
+ * 残るのは createImageBitmap だけなので、描画は分離に巻き込まれない。
+ * この 2 ファイルをコピーすれば他プロジェクトでも動きます（依存は
+ * onnxruntime-web だけで、それも Worker 側が CDN から読む）。
  *
  * 使い方:
  *   const seg = await createSkySegmenter();
  *   const mask = await seg.segment(videoElement);   // { width, height, data }
  *   // mask.data[y * mask.width + x] = 0.0(空でない) 〜 1.0(空)
+ *
+ * 必要なもの: module worker と OffscreenCanvas（Safari 16.4+ / Chrome 69+）。
  */
 
 export const SKY_SEGMENTER_DEFAULTS = {
@@ -28,261 +32,83 @@ export const SKY_SEGMENTER_DEFAULTS = {
   refineEps: 1e-4,
   // 出力マスクの解像度。inputSize の整数倍に丸められる（384 を渡せば 512 になる）。
   // ここを上げるほど輪郭がシャープになるが、取り込みと読み戻しもこの解像度で
-  // 行うため、実機では getImageData の同期待ちが上限を決める。実際の値は
-  // 生成後に maskSize で確認できる。
+  // 行う。実際の値は生成後に maskSize で確認できる。
   refineSize: 512,
   // 確率の 0→1 遷移をどれだけ立てるか。1 でそのまま、大きいほど輪郭がくっきりする。
   // 0.5 を境に (p-0.5)*k+0.5 で伸ばすだけなので、位置はずらさず境界の幅だけ縮む。
   edgeSharpness: 6,
+  // onnxruntime-web。ESM 版を Worker 側が import する。
+  ortUrl: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.wasm.min.mjs',
   ortWasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/',
 };
 
-const MEAN = [0.485, 0.456, 0.406]; // ImageNet 正規化（学習時と同じ前処理）
-const STD = [0.229, 0.224, 0.225];
-
 export async function createSkySegmenter(options = {}) {
   const cfg = { ...SKY_SEGMENTER_DEFAULTS, ...options };
-
-  // GitHub Pages は COOP/COEP ヘッダを付けられない = SharedArrayBuffer が使えないため、
-  // wasm はシングルスレッドに固定する（自動判定に任せると初期化に失敗することがある）。
-  ort.env.wasm.wasmPaths = cfg.ortWasmPaths;
-  ort.env.wasm.numThreads = 1;
-  // 推論を Web Worker 側で実行する。これがないと推論中(数百ms)メインスレッドが
-  // 止まり、カメラ映像の描画がその間フリーズする。
-  ort.env.wasm.proxy = true;
-
-  const session = await ort.InferenceSession.create(cfg.modelUrl, {
-    executionProviders: ['wasm'],
-    graphOptimizationLevel: 'all',
+  const worker = new Worker(new URL('./sky-segmenter.worker.js', import.meta.url), {
+    type: 'module',
   });
 
-  const size = cfg.inputSize;
-  // 映像はマスク解像度で取り込み、モデル入力はそこから面積平均で縮小する。
-  // getImageData が 1 回で済み、縮小も単純間引きよりきれいになる。
-  // 畳み込む画素数を先に決め、取り込み解像度をそこから導く。refineSize を
-  // そのまま使うと inputSize の整数倍でない値（384 など）で縮小ループが
-  // capture の外を読み、NaN が入ったまま動き続ける（384 実測: 「縮小と正規化」が
-  // 0.5ms → 8ms に跳ね、マスクも壊れる）。呼び出し側の値は丸めて受ける。
-  const pool = Math.max(1, Math.round(cfg.refineSize / size)); // 何画素を 1 画素に畳むか
-  const capture = size * pool;                                 // 必ず inputSize の整数倍
-  const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = capture;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const guideHi = new Float32Array(capture * capture); // 高解像度の輝度ガイド
-  const guideLo = new Float32Array(size * size); // 統計量計算用に縮小した輝度
-
-  // 作業用バッファ。毎フレーム確保すると 1 フレームで数 MB のゴミになり、
-  // モバイルでは GC が時々 1 フレーム分の時間を丸ごと奪う（実測で
-  // guidedCoeffs と boxFilter の内部だけで 1 フレーム 4MB 近く）。
-  // Worker へ転送される input 以外は使い回せるので、ここで 1 回だけ取る。
-  const scratch = new Map();
-  const buf = (key, len) => {
-    let a = scratch.get(key);
-    if (!a || a.length !== len) scratch.set(key, (a = new Float32Array(len)));
-    return a;
+  // Worker とのやりとりは常に 1 往復ずつ。投げっぱなしにすると推論が重なり、
+  // 古いフレームの結果を待つ分だけ遅れが積み上がる。
+  let seq = 0;
+  const waiting = new Map();
+  worker.onmessage = ({ data }) => {
+    const done = waiting.get(data.id);
+    if (!done) return;
+    waiting.delete(data.id);
+    if (data.type === 'error') done.reject(new Error(data.message));
+    else done.resolve(data);
   };
-  const inputName = session.inputNames[0];
-  const outputName = session.outputNames[0];
+  worker.onerror = (e) => {
+    const err = new Error(e.message || 'sky-segmenter.worker.js が読み込めませんでした');
+    for (const { reject } of waiting.values()) reject(err);
+    waiting.clear();
+  };
+  const ask = (msg, transfer = []) =>
+    new Promise((resolve, reject) => {
+      const id = ++seq;
+      waiting.set(id, { resolve, reject });
+      worker.postMessage({ ...msg, id }, transfer);
+    });
+
+  const ready = await ask({ type: 'init', cfg });
+
+  // 取り込み用。メインスレッドに残すのはこの 1 枚への drawImage だけで、
+  // 読み戻し (getImageData) は Worker 側にある。
+  // 元の要素から直接 createImageBitmap すると、実測で 1958×1290 の静止画に
+  // 14.8ms かかる（フル解像度のビットマップを作るため。resizeWidth を付けても
+  // 変わらない）。小さいキャンバスへ一度描いてから渡すと 0.6ms で済む。
+  const capture = new OffscreenCanvas(ready.maskSize, ready.maskSize);
+  const captureCtx = capture.getContext('2d');
+
+  // 前のフレームで返ってきたマスク。次のフレームで Worker に返して使い回す。
+  let spare = null;
 
   /**
    * @param {CanvasImageSource} source video / canvas / img / ImageBitmap
-   * @returns {Promise<{width:number, height:number, data:Float32Array}>} 空である確率(0..1)
+   * @returns {Promise<{width:number, height:number, data:Float32Array, timings:object}>}
+   *          空である確率(0..1)と、Worker 側で測った工程別の所要 ms
    *
-   * ※ data は内部で使い回しているバッファです。次の segment() で上書きされるので、
-   *   フレームを跨いで持つ場合は呼び出し側でコピーしてください
-   *   （毎フレーム 1MB の確保を避けるため。使い終わるまでに次を呼ばなければ安全）。
+   * ※ data は Worker と往復して使い回しているバッファです。次の segment() で
+   *   持っていかれるので、フレームを跨いで持つ場合はコピーしてください。
    */
   async function segment(source) {
-    // 1. マスク解像度で取り込む
-    ctx.drawImage(source, 0, 0, capture, capture);
-    const { data: rgba } = ctx.getImageData(0, 0, capture, capture);
-
-    // 2. pool×pool の面積平均でモデル入力サイズへ縮小しつつ、NCHW / 正規化 / 低解像度ガイドを同時に作る
-    //    ※ Worker 実行時に ArrayBuffer が転送されるため、input は毎回確保し直す
-    const input = new Float32Array(3 * size * size);
-    const plane = size * size;
-    const inv = 1 / (pool * pool);
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        let r = 0;
-        let g = 0;
-        let b = 0;
-        for (let dy = 0; dy < pool; dy++) {
-          let p = ((y * pool + dy) * capture + x * pool) * 4;
-          for (let dx = 0; dx < pool; dx++, p += 4) {
-            r += rgba[p];
-            g += rgba[p + 1];
-            b += rgba[p + 2];
-          }
-        }
-        r *= inv;
-        g *= inv;
-        b *= inv;
-        const i = y * size + x;
-        input[i] = (r / 255 - MEAN[0]) / STD[0];
-        input[i + plane] = (g / 255 - MEAN[1]) / STD[1];
-        input[i + plane * 2] = (b / 255 - MEAN[2]) / STD[2];
-        guideLo[i] = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
-      }
-    }
-
-    // 3. 高解像度のガイド（輝度）。輪郭の細さはここの解像度で決まる
-    for (let i = 0, p = 0; i < guideHi.length; i++, p += 4) {
-      guideHi[i] = (rgba[p] * 0.299 + rgba[p + 1] * 0.587 + rgba[p + 2] * 0.114) / 255;
-    }
-
-    // 4. 推論。出力は低解像度のロジット
-    const outputs = await session.run({
-      [inputName]: new ort.Tensor('float32', input, [1, 3, size, size]),
-    });
-    const logits = outputs[outputName];
-    const [, numClasses, h, w] = logits.dims;
-    const values = logits.data;
-
-    // 5. 「空」と「空以外の最大」の 2 値ソフトマックス = sigmoid(sky - maxOther - margin)
-    //    150 クラス全部の softmax より安く、境界がなめらかな確率になる。
-    const area = h * w;
-    const coarse = buf('coarse', area);
-    if (numClasses === 1) {
-      // 空/非空の二値モデル: ロジットをそのまま sigmoid するだけ
-      for (let i = 0; i < area; i++) coarse[i] = 1 / (1 + Math.exp(-values[i]));
-    } else {
-      for (let i = 0; i < area; i++) {
-        const sky = values[cfg.skyClassIndex * area + i];
-        let other = -Infinity;
-        for (let c = 0; c < numClasses; c++) {
-          if (c === cfg.skyClassIndex) continue;
-          const v = values[c * area + i];
-          if (v > other) other = v;
-        }
-        coarse[i] = 1 / (1 + Math.exp(other - sky + cfg.skyMargin));
-      }
-    }
-
-    if (!cfg.refineRadius) {
-      return { width: w, height: h, data: sharpen(coarse, cfg.edgeSharpness, buf('sharp', area)) };
-    }
-
-    // 6. fast guided filter:
-    //    線形係数 a, b は低解像度（inputSize）で求め、それを拡大して
-    //    高解像度のガイドに当てる。box filter の計算量は据え置きのまま、
-    //    輪郭だけ capture の解像度で吸着する（He et al. 2010 の 4.1 節）。
-    const pLo = bilinear(coarse, w, h, size, buf('pLo', size * size));
-    const { a, b } = guidedCoeffs(guideLo, pLo, size, cfg.refineRadius, cfg.refineEps, buf);
-    const aHi = bilinear(a, size, size, capture, buf('aHi', capture * capture));
-    const bHi = bilinear(b, size, size, capture, buf('bHi', capture * capture));
-
-    const out = buf('out', guideHi.length);
-    const k = cfg.edgeSharpness;
-    for (let i = 0; i < out.length; i++) {
-      const v = (aHi[i] * guideHi[i] + bHi[i] - 0.5) * k + 0.5;
-      out[i] = v < 0 ? 0 : v > 1 ? 1 : v;
-    }
-    return { width: capture, height: capture, data: out };
+    // 取り込みはここだけ。drawImage は GPU に積むだけで完了を待たず、
+    // transferToImageBitmap は中身を持ち出すだけなので、どちらも同期読み戻しを
+    // 起こさない。正方形に潰すのもここ（縦横比は呼び出し側が拡大で戻す）。
+    captureCtx.drawImage(source, 0, 0, capture.width, capture.height);
+    const bitmap = capture.transferToImageBitmap();
+    const transfer = [bitmap];
+    if (spare) transfer.push(spare.buffer);
+    const res = await ask({ type: 'frame', bitmap, out: spare }, transfer);
+    spare = res.data;
+    return res;
   }
 
   return {
     segment,
-    inputSize: size,
-    maskSize: capture,
-    dispose: () => session.release?.(),
-  };
-}
-
-/** 0.5 を境に確率のコントラストを立てる（遷移帯の幅を 1/k にする） */
-function sharpen(src, k, dst = new Float32Array(src.length)) {
-  if (!k || k === 1) return src;
-  for (let i = 0; i < src.length; i++) {
-    const v = (src[i] - 0.5) * k + 0.5;
-    dst[i] = v < 0 ? 0 : v > 1 ? 1 : v;
-  }
-  return dst;
-}
-
-/** 正方形マスクのバイリニア拡大。dst を渡せばそこへ書く。 */
-function bilinear(src, w, h, size, dst = new Float32Array(size * size)) {
-  const sx = w / size;
-  const sy = h / size;
-  for (let y = 0; y < size; y++) {
-    const fy = Math.min((y + 0.5) * sy - 0.5, h - 1);
-    const y0 = Math.max(0, Math.floor(fy));
-    const y1 = Math.min(y0 + 1, h - 1);
-    const wy = fy - y0;
-    for (let x = 0; x < size; x++) {
-      const fx = Math.min((x + 0.5) * sx - 0.5, w - 1);
-      const x0 = Math.max(0, Math.floor(fx));
-      const x1 = Math.min(x0 + 1, w - 1);
-      const wx = fx - x0;
-      const a = src[y0 * w + x0] * (1 - wx) + src[y0 * w + x1] * wx;
-      const b = src[y1 * w + x0] * (1 - wx) + src[y1 * w + x1] * wx;
-      dst[y * size + x] = a * (1 - wy) + b * wy;
-    }
-  }
-  return dst;
-}
-
-/**
- * 移動平均（累積和による O(N) 実装）
- * dst / tmp を渡せばそこへ書く。横方向は src→tmp、縦方向は tmp→dst なので、
- * dst は src と同じ配列でも構わない（tmp だけは別の配列にすること）。
- */
-function boxFilter(src, size, r, dst = new Float32Array(size * size), tmp = new Float32Array(size * size)) {
-  for (let y = 0; y < size; y++) {
-    const row = y * size;
-    let sum = 0;
-    for (let x = 0; x < r && x < size; x++) sum += src[row + x];
-    for (let x = 0; x < size; x++) {
-      const lo = x - r - 1;
-      const hi = x + r;
-      if (hi < size) sum += src[row + hi];
-      if (lo >= 0) sum -= src[row + lo];
-      tmp[row + x] = sum / (Math.min(hi, size - 1) - Math.max(lo + 1, 0) + 1);
-    }
-  }
-  for (let x = 0; x < size; x++) {
-    let sum = 0;
-    for (let y = 0; y < r && y < size; y++) sum += tmp[y * size + x];
-    for (let y = 0; y < size; y++) {
-      const lo = y - r - 1;
-      const hi = y + r;
-      if (hi < size) sum += tmp[hi * size + x];
-      if (lo >= 0) sum -= tmp[lo * size + x];
-      dst[y * size + x] = sum / (Math.min(hi, size - 1) - Math.max(lo + 1, 0) + 1);
-    }
-  }
-  return dst;
-}
-
-/**
- * ガイデッドフィルタ (He et al., 2010) の線形係数 a, b を求める。
- * 出力は「マスク ≒ a * ガイド輝度 + b」の形でガイドの輪郭に沿う。
- * a, b は元画像より滑らかなので、低解像度で求めて拡大しても品質がほとんど落ちない
- * （= fast guided filter）。
- */
-function guidedCoeffs(I, p, size, r, eps, buf = (key, len) => new Float32Array(len)) {
-  const n = size * size;
-  const tmp = buf('box.tmp', n); // boxFilter の作業用。呼ぶたびに丸ごと上書きされる
-  const Ip = buf('gc.Ip', n);
-  const II = buf('gc.II', n);
-  for (let i = 0; i < n; i++) {
-    Ip[i] = I[i] * p[i];
-    II[i] = I[i] * I[i];
-  }
-  const meanI = boxFilter(I, size, r, buf('gc.meanI', n), tmp);
-  const meanP = boxFilter(p, size, r, buf('gc.meanP', n), tmp);
-  const meanIp = boxFilter(Ip, size, r, buf('gc.meanIp', n), tmp);
-  const meanII = boxFilter(II, size, r, buf('gc.meanII', n), tmp);
-
-  const a = buf('gc.a', n);
-  const b = buf('gc.b', n);
-  for (let i = 0; i < n; i++) {
-    const cov = meanIp[i] - meanI[i] * meanP[i];
-    const varI = meanII[i] - meanI[i] * meanI[i];
-    a[i] = cov / (varI + eps);
-    b[i] = meanP[i] - a[i] * meanI[i];
-  }
-  return {
-    a: boxFilter(a, size, r, buf('gc.meanA', n), tmp),
-    b: boxFilter(b, size, r, buf('gc.meanB', n), tmp),
+    inputSize: ready.inputSize,
+    maskSize: ready.maskSize,
+    dispose: () => worker.terminate(),
   };
 }

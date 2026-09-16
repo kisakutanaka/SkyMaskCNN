@@ -6,8 +6,14 @@
 **デモ**: https://kisakutanaka.github.io/SkyMaskCNN/
 
 **画面と合成は [SkyMaskCV](https://github.com/kisakutanaka/SkyMaskCV) と同じもので、
-背景分離の中身だけを差し替えてあります。** 古典CV と CNN を同じ入力・同じ表示・
-同じ計測で並べて比べるためです。
+背景分離の中身だけを差し替えてあります。** 古典CV と CNN を同じ入力・同じ表示で
+並べて比べるためです。
+
+ただし**ループ構造だけは途中で分かれました**。SkyMaskCV は 1 フレームの中で
+分離まで終わるので 1 ループですが、こちらは分離が実機で 40ms 前後かかるため、
+表示と分離を別のループにしています（下記「速度」）。そのため stats も
+「描画 fps」と「分離 1 枚の ms」を別々に出します。**SkyMaskCV の ms/frame と
+突き合わせるべきなのは後者**です。
 
 左に元映像、右に分離結果を並べて表示します。入力は同梱の動画・静止画のほか、
 カメラ（HTTPS が必要なので GitHub Pages 上でのみ利用可）に切り替えられます。
@@ -20,7 +26,9 @@
 ## 分離の流れ
 
 ```
-映像 → 512×512 で取り込み（getImageData 1回）
+映像 → 512×512 へ drawImage（メインスレッド。GPU に積むだけ）
+     → transferToImageBitmap で Worker へ転送（ここから下は全部 Worker）
+     → getImageData（同期読み戻し。実機で最大のコスト）
      → 2×2 の面積平均で 256×256 へ縮小 + ImageNet 正規化
      → CNN 推論 → [1, 1, 128, 128] のロジット
      → sigmoid → 空である確率（0..1）
@@ -39,9 +47,24 @@ fast guided filter）で被写体の縁へ吸着させています。この後�
 
 ## 速度
 
-手元の Mac + Chrome（ヘッドレス, `--disable-gpu`）で 分離 15ms / フレーム全体 20〜25ms。
-**実機の iPhone (Safari) では 30fps の予算 33ms に収まりません。**
-カメラモードで計測した実測（工程は直近60フレームの中央値）:
+**表示と分離は別のループで回り、分離は丸ごと Worker の中にあります。**
+メインスレッドに残る取り込みは `drawImage` と `transferToImageBitmap` だけで、
+同期読み戻し (`getImageData`) は Worker 側です。表示は分離の完了を待たず、
+そのときの最新マスクを使い回します（マスクの追従だけが 1〜2 フレーム遅れる）。
+
+手元の Mac + Chrome（ヘッドレス, `--disable-gpu`, 曇天01）での実測:
+
+| | 分離 1 枚 | Worker 内の合計 | 描画 |
+|---|---|---|---|
+| 現行（分離は Worker） | **16 ms** | 14.1 ms | 60 fps（合成 9.1 ms/frame） |
+| 旧（分離もメインスレッド） | 15 ms | — | 分離と同じループ = 分離待ち |
+
+Worker 内の内訳は 推論 7.1ms / ガイデッドフィルタ 5.1ms / 縮小と正規化 0.9ms /
+`getImageData` 0.3ms（Mac は `--disable-gpu` なので読み戻しが安い。実機では別）。
+
+### 実機 iPhone (Safari)
+
+**下の数字は「分離もメインスレッドで動かしていた頃」のもの**で、Worker 化前です。
 
 | refineSize | 経過 | フレーム全体 | 分離の合計 | getImageData | 推論 | ガイデッドフィルタ |
 |---|---|---|---|---|---|---|
@@ -51,26 +74,22 @@ fast guided filter）で被写体の縁へ吸着させています。この後�
 
 参考: SkyMaskCV は iPhone SE (第3世代) でフレーム全体 7.5ms。
 
-この表から読めることが2つあります。
+ここから分かったことが 2 つあり、それが現行の構成を決めています。
 
 **1. 最大のコストは推論ではなく読み戻し (`getImageData`)。しかも解像度にほぼ
-比例しません。** 512 と 256 では画素数が 4 倍違うのに、同じ熱状態で 19ms と 18ms です。
+比例しません。** 512 と 256 では画素数が 4 倍違うのに、同じ熱状態で 19ms と 18ms。
 効いているのは転送量ではなく **GPU の描画完了を待つ同期**で、これは固定費です。
-`refineSize` を 512 → 256 に下げても合計は 42 → 37ms（12%）にしかならないので、
-**既定は 512 のまま**にしています（輪郭の精度を落とす価値がない）。
-Mac で `--disable-gpu` だと 0.2ms しか出ないため、この工程は実機でしか見えません。
+`refineSize` を下げても合計は 42 → 37ms（12%）にしかならないので、**既定は 512 のまま**
+にしています（輪郭の精度を落とす価値がない）。減らせないので、**Worker に移して
+メインスレッドから外す**のが現行の答えです。分離 1 枚の時間は変わりませんが、
+描画がそれに巻き込まれなくなります。
 
 **2. 熱ダレが 1.4 倍効く。** refineSize 256 で、開始直後 26ms が 1 分後には 37ms です。
-**開始直後だけは 30fps に入る**が、回し続けると入らない、というのが現状です。
-（iOS の `performance.now()` は 1ms 刻みに丸められるため、1ms 未満の工程は 0 と出ます）
 
-次に効きそうなのは、取り込みと読み戻しを推論と同じ Worker に移して
-（`createImageBitmap` + `OffscreenCanvas`）メインスレッドから同期待ちを外すことです。
-分離自体のレイテンシは変わりませんが、描画が読み戻しに巻き込まれなくなります。
-推論は `ort.env.wasm.proxy = true` で既に Worker 側です。
-
-計測は [bench.html](bench.html) で行えます（本番とは別ページ）。工程別の中央値を
-画面に出すので、実機に Mac を繋がなくても読めます。`?refine=256` で解像度を変えられます。
+**Worker 化後の実機の数字はまだありません。** 分離 1 枚のコストは変わらない見込みで、
+変わるのは描画が分離を待たなくなる点です。計測は [bench.html](bench.html) で行えます
+（本番とは別ページ。工程別の中央値を画面に出すので、実機に Mac を繋がなくても読めます。
+`?refine=256` で解像度を変えられます）。
 
 ## 起動コスト
 
@@ -82,7 +101,7 @@ SkyMaskCV と違い、**最初の1フレームの前に onnxruntime-web の wasm
 |---|---|
 | `ort-wasm-simd-threaded.wasm` | **2,926 KB** |
 | `tinyskynet_skyseg_256.onnx` | 199 KB |
-| `ort.wasm.min.js` + `...threaded.mjs` | 16 + 9 KB |
+| `ort.wasm.min.mjs` + `...threaded.mjs` | 16 + 9 KB |
 | `index.html` + `sky-segmenter.js` | 23 KB |
 | 合計 | **約 3.1 MB** |
 
@@ -91,15 +110,15 @@ SkyMaskCV と違い、**最初の1フレームの前に onnxruntime-web の wasm
 （この表は手法に要る分だけです。デモの既定ソースは同梱動画 4.9MB なので、
 ページ全体の通信量はさらにその分がかかります。）
 
-読み込む ort は **wasm 専用ビルド (`ort.wasm.min.js`) を指定しています。**
-既定の `ort.min.js` は WebGPU/WebNN 対応を含む jsep 版の wasm (5,234 KB) を
-取りに行きますが、`sky-segmenter.js` は `executionProviders: ['wasm']` 固定で
+読み込む ort は **wasm 専用ビルド (`ort.wasm.min.mjs`) を Worker 側が import します**
+（メインスレッドは ort を読みません）。既定の `ort.min.js` は WebGPU/WebNN 対応を含む
+jsep 版の wasm (5,234 KB) を取りに行きますが、`executionProviders: ['wasm']` 固定で
 その機能を使っていません。差し替えで**通信量 5.4MB → 3.1MB、起動は手元の実測で
 1.6 秒 → 0.9 秒**（キャッシュ無効・CDN が温まった状態）になりました。回線が細い
 環境ほど差は大きく、別環境では 5.1 秒 → 1.1 秒 という実測もあります。
 **推論速度と精度は変わりません**（推論の差はフレーム間のばらつきの範囲）。
 引き換えに将来 WebGPU / WebNN を試す選択肢は閉じますが、戻すのは
-`index.html` の script タグ 1 行を `ort.min.js` に戻すだけです。
+`sky-segmenter.js` の `ortUrl` を `ort.min.mjs` に戻すだけです。
 
 wasm は GitHub Pages が COOP/COEP ヘッダを付けられない = SharedArrayBuffer が
 使えないため、シングルスレッドに固定しています。
@@ -108,12 +127,14 @@ wasm は GitHub Pages が COOP/COEP ヘッダを付けられない = SharedArray
 
 | ファイル | 役割 |
 |---|---|
-| `index.html` | 画面・ループ・合成。SkyMaskCV とは分離の呼び出しだけが違う |
-| `sky-segmenter.js` | 取り込み・正規化・推論・ガイデッドフィルタ。依存はグローバルの `ort` だけ |
+| `index.html` | 画面・描画ループ・合成。分離は別ループで呼ぶ |
+| `sky-segmenter.js` | 公開 API（メインスレッド側）。取り込みと Worker とのやりとりだけ |
+| `sky-segmenter.worker.js` | 読み戻し・正規化・推論・ガイデッドフィルタ。ort もここが読む |
 | `models/` | 同梱モデルと、その出所・ライセンス（[models/README.md](models/README.md)）|
 
-`sky-segmenter.js` は[隣の SkySegmentation](https://github.com/kisakutanaka/SkySegmentation)
-から持ってきたもので、そのままコピーすれば他プロジェクトでも動きます。
+`sky-segmenter.js` と `sky-segmenter.worker.js` は 2 つで 1 組で、そのままコピーすれば
+他プロジェクトでも動きます（元は[隣の SkySegmentation](https://github.com/kisakutanaka/SkySegmentation)
+の 1 ファイル版）。module worker と OffscreenCanvas が要ります（Safari 16.4+ / Chrome 69+）。
 モデルの学習・評価コードもそちらにあります。
 
 ## 既知の限界
@@ -123,8 +144,8 @@ wasm は GitHub Pages が COOP/COEP ヘッダを付けられない = SharedArray
 - `refineSize` は `inputSize` (256) の整数倍に丸められる。384 のような値を渡すと
   512 になる（丸めずに使うと縮小ループが取り込み範囲の外を読む）
 - 時間方向の平滑化は入れていないため、動画ではフレーム間のちらつきが残る
-- 実機のフレームコストが 30fps の予算に収まっていない（上記「速度」）。
-  熱ダレ後は 256 でも 39ms
+- 分離 1 枚のコストが 30fps の予算に収まっていない（上記「速度」）。
+  Worker 化で描画は分離を待たなくなったが、マスクの更新レートは上がっていない
 - `file://` では ES module と wasm の取得に失敗する。ローカル確認は HTTP サーバ経由で
   （例: `python3 -m http.server`）
 
