@@ -39,15 +39,45 @@ fast guided filter）で被写体の縁へ吸着させています。この後�
 
 ## 速度
 
-手元の Mac + Chrome（ヘッドレス, `--disable-gpu`）で **推論 15ms 前後 /
+手元の Mac + Chrome（ヘッドレス, `--disable-gpu`）で **推論 15〜16ms /
 フレーム全体 20〜25ms**（512×512 のマスク）。**実機のモバイルでは未計測**です。
+SkyMaskCV 側は iPhone SE (第3世代) でフレーム全体 7.5ms が実測済みなので、
+この方式を採るかどうかは**実機で 33ms に収まるか**で決まります。
+
 推論は `ort.env.wasm.proxy = true` で Web Worker 側に出しているので、
 数百 ms かかる端末でもメインスレッドの描画は止まりません。
 
-SkyMaskCV と違い、**最初の1フレームの前にモデル（199KB）と onnxruntime-web の wasm を
-CDN から取ってくる待ちがあります**（その間 stats に「モデルを読み込んでいます…」と出ます）。
-wasm は GitHub Pages が COOP/COEP ヘッダを付けられない = SharedArrayBuffer が使えない
-ため、シングルスレッドに固定しています。
+## 起動コスト
+
+SkyMaskCV と違い、**最初の1フレームの前に onnxruntime-web の wasm とモデルを
+取ってくる待ちがあります**（その間 stats に「モデルを読み込んでいます…」と出ます）。
+**通信量の 9 割はモデルではなくランタイム**です。
+
+| 起動時に取るもの | サイズ（brotli 後・実測） |
+|---|---|
+| `ort-wasm-simd-threaded.wasm` | **2,926 KB** |
+| `tinyskynet_skyseg_256.onnx` | 199 KB |
+| `ort.wasm.min.js` + `...threaded.mjs` | 16 + 9 KB |
+| `index.html` + `sky-segmenter.js` | 23 KB |
+| 合計 | **約 3.1 MB** |
+
+モデルを 199KB に絞った効果は、通信量では**ほぼ見えません**（モデルを 0 にしても
+2.9MB 残る）。49K パラメータ 1 本のために汎用ランタイムを積んでいる構図です。
+（この表は手法に要る分だけです。デモの既定ソースは同梱動画 4.9MB なので、
+ページ全体の通信量はさらにその分がかかります。）
+
+読み込む ort は **wasm 専用ビルド (`ort.wasm.min.js`) を指定しています。**
+既定の `ort.min.js` は WebGPU/WebNN 対応を含む jsep 版の wasm (5,234 KB) を
+取りに行きますが、`sky-segmenter.js` は `executionProviders: ['wasm']` 固定で
+その機能を使っていません。差し替えで**通信量 5.4MB → 3.1MB、起動は手元の実測で
+1.6 秒 → 0.9 秒**（キャッシュ無効・CDN が温まった状態）になりました。回線が細い
+環境ほど差は大きく、別環境では 5.1 秒 → 1.1 秒 という実測もあります。
+**推論速度と精度は変わりません**（推論の差はフレーム間のばらつきの範囲）。
+引き換えに将来 WebGPU / WebNN を試す選択肢は閉じますが、戻すのは
+`index.html` の script タグ 1 行を `ort.min.js` に戻すだけです。
+
+wasm は GitHub Pages が COOP/COEP ヘッダを付けられない = SharedArrayBuffer が
+使えないため、シングルスレッドに固定しています。
 
 ## 構成
 

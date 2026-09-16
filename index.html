@@ -51,8 +51,11 @@
 </div>
 
 <!-- sky-segmenter.js はグローバルの ort に依存する。module より先に実行される
-     クラシックスクリプトで読むので、import 時点では必ず定義済みになる。 -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.min.js"></script>
+     クラシックスクリプトで読むので、import 時点では必ず定義済みになる。
+     wasm 専用ビルドを選ぶ。ort.min.js だと WebGPU/WebNN 対応を含む jsep 版の wasm
+     (brotli 後 5.2MB) を取りに行くが、executionProviders は ['wasm'] 固定でその
+     機能を使っていない。こちらは 2.9MB で、推論速度は変わらず起動だけ速くなる。 -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.wasm.min.js"></script>
 
 <script type="module">
 import { createSkySegmenter } from './sky-segmenter.js';
