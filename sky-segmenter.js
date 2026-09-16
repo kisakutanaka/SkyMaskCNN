@@ -69,11 +69,14 @@ export async function createSkySegmenter(options = {}) {
     for (const { reject } of waiting.values()) reject(err);
     waiting.clear();
   };
+  let postMs = 0; // 直近の postMessage にかかった時間（内訳表示用）
   const ask = (msg, transfer = []) =>
     new Promise((resolve, reject) => {
       const id = ++seq;
       waiting.set(id, { resolve, reject });
+      const t = performance.now();
       worker.postMessage({ ...msg, id }, transfer);
+      postMs = performance.now() - t;
     });
 
   const ready = await ask({ type: 'init', cfg });
@@ -86,16 +89,18 @@ export async function createSkySegmenter(options = {}) {
   const capture = new OffscreenCanvas(ready.maskSize, ready.maskSize);
   const captureCtx = capture.getContext('2d');
 
-  // 前のフレームで返ってきたマスク。次のフレームで Worker に返して使い回す。
-  let spare = null;
+  // 返し終わったマスクのバッファを貯めておき、次のフレームで Worker へ返す。
+  // 2 枚以上を同時に投げられるようにしたので、1 枚だけ持つ形ではなく池にする。
+  const pool = [];
 
   /**
    * @param {CanvasImageSource} source video / canvas / img / ImageBitmap
    * @returns {Promise<{width:number, height:number, data:Float32Array, timings:object}>}
    *          空である確率(0..1)と、Worker 側で測った工程別の所要 ms
    *
-   * ※ data は Worker と往復して使い回しているバッファです。次の segment() で
-   *   持っていかれるので、フレームを跨いで持つ場合はコピーしてください。
+   * ※ data は Worker と往復して使い回しているバッファです。使い終わったら
+   *   recycle(mask) を呼んでください（呼ぶと次のフレームで Worker が再利用します）。
+   *   recycle 後に触ると中身は空です。跨いで持つならコピーしてください。
    */
   async function segment(source) {
     // 取り込みはここだけ。drawImage は GPU に積むだけで完了を待たず、
@@ -104,19 +109,29 @@ export async function createSkySegmenter(options = {}) {
     const t0 = performance.now();
     captureCtx.drawImage(source, 0, 0, capture.width, capture.height);
     const bitmap = capture.transferToImageBitmap();
+    const out = pool.pop() ?? null;
     const transfer = [bitmap];
-    if (spare) transfer.push(spare.buffer);
+    if (out) transfer.push(out.buffer);
     const sync = performance.now() - t0;
-    const res = await ask({ type: 'frame', bitmap, out: spare }, transfer);
-    spare = res.data;
+    const res = await ask({ type: 'frame', bitmap, out }, transfer);
     // 取り込みと往復も内訳に混ぜる。Worker 内の合計との差がここに出る。
     res.timings['取り込み(メイン)'] = sync;
+    res.timings['postMessage'] = postMs;
     res.timings['往復と待ち'] = performance.now() - t0 - sync - res.timings['合計'];
     return res;
   }
 
+  /**
+   * 使い終わったマスクを返して、次のフレームで使い回してもらう。
+   * 呼ばなくても動くが、毎フレーム 1MB の確保が Worker 側で起きる。
+   */
+  function recycle(mask) {
+    if (mask?.data?.length) pool.push(mask.data);
+  }
+
   return {
     segment,
+    recycle,
     inputSize: ready.inputSize,
     maskSize: ready.maskSize,
     coeffSize: ready.coeffSize,

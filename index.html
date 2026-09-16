@@ -71,6 +71,13 @@ const SEGMENTER_OPTIONS = {
   refineSize: 512,
 };
 
+// 同時に Worker へ投げておく枚数。1 だと「投げる→待つ→次を投げる」になり、
+// 往復の待ち時間のあいだ Worker が遊ぶ（実機で 1 枚 46ms のうち 14ms が
+// メッセージの往復待ちだった。Mac では 0.1ms なので iOS 側の配送の都合）。
+// 2 にすると次の 1 枚が Worker の手元に積まれるので、その待ちが隠れる。
+// 引き換えに、表示は 1 枚ぶん余分に古くなる。
+const DEPTH = 2;
+
 const video = document.getElementById('video');
 const still = document.getElementById('still');
 const mode = document.getElementById('mode');
@@ -85,8 +92,10 @@ const fg = makeCanvas(1, 1);                 // 手前レイヤー: 空を抜い
 // 分離に渡したフレームの控え。マスクが届いたら「そのマスクを作った元のフレーム」と
 // 対で合成する。最新フレームに古いマスクを載せると、カメラを振ったときに輪郭が
 // 1〜3 フレーム分ずれるため。表示レートは分離レートまで落ちるが、出る絵は必ず整合する。
-// 次の分離が走っている間も表示中の1枚を保つ必要があるので、2枚で回す。
-const shots = [makeCanvas(1, 1), makeCanvas(1, 1)];
+// 投げてある DEPTH 枚 + 表示中の 1 枚 + 余裕 1 枚。余裕がないと、表示した直後の
+// 1 枚に次のフレームを描いてしまい、モード変更などで描き直したときだけ
+// 「新しい映像 + 古いマスク」になる（合成そのものは順序が守られるので出ない）。
+const shots = Array.from({ length: DEPTH + 2 }, () => makeCanvas(1, 1));
 let shotIdx = 0;
 let display = null;                          // いま合成に使うフレーム（マスクと対）
 
@@ -177,8 +186,9 @@ function drawKaiju(vw, vh) {
 
 // --- 計測 ---
 // 表示は「マスクとフレームの対が揃うたび」なので、描画レートは分離レートと
-// 同じになる。SkyMaskCV の「ms/frame」に対応するのは分離のほう
-// （1枚のマスクを作る実コスト）。左の元映像だけはカメラのレートで動く。
+// 同じになる。SkyMaskCV の「ms/frame」に対応するのは「分離 ms/枚」のほう。
+// 「遅れ」は投げてから返るまでで、DEPTH 枚を同時に投げているぶん ms/枚 より長い。
+// 左の元映像だけはカメラのレートで動く。
 const stats = document.getElementById('stats');
 let accDraw = 0, nDraw = 0, lastStats = performance.now();
 let segMs = 0, segCount = 0, lastTimings = null;
@@ -190,8 +200,10 @@ function report() {
   if (!nDraw || span < 1) return;
   const drawFps = (nDraw / span) * 1000;
   const segFps = (segCount / span) * 1000;
+  const period = segCount ? span / segCount : 0;
   stats.textContent = `表示 ${drawFps.toFixed(0)} fps (合成 ${(accDraw / nDraw).toFixed(2)} ms)`
-                    + `  分離 ${segMs.toFixed(1)} ms → ${segFps.toFixed(1)} fps`
+                    + `  分離 ${period.toFixed(1)} ms/枚 → ${segFps.toFixed(1)} fps`
+                    + `  遅れ ${segMs.toFixed(0)} ms`
                     + `  ${maskCv.el.width}×${maskCv.el.height}`;
   accDraw = 0; nDraw = 0; segCount = 0; lastStats = now;
 }
@@ -205,8 +217,7 @@ let loopId = 0;
 function startLoop() {
   const id = ++loopId;
   (async () => {
-    let mask = null;                           // 1 つ前の結果
-    let shot = null;                           // そのマスクを作った元のフレーム
+    const inflight = [];                       // 投げてあるぶん（先頭が最も古い）
     while (id === loopId) {
       const [vw, vh] = sizeOf(active);
       if (!segmenter || !vw) {                 // 準備前、または寸法がまだ来ていない
@@ -214,34 +225,24 @@ function startLoop() {
         continue;
       }
 
-      // --- 1. 前のマスクをアルファへ焼く ---
-      // 次の segment() でこのバッファは Worker へ返す（転送で手放す）ので、
-      // それより先に使い切っておく。
-      if (mask) updateMask(mask);
-
-      // --- 2. 次のフレームを投げる ---
-      // 控えは同じ同期ブロックで撮る。segment() の中の取り込み（drawImage）も
-      // await より手前で走るので、両者は必ず同じ1枚を見る。
-      const next = shots[shotIdx];
-      shotIdx ^= 1;                            // 表示中の1枚を潰さないよう2枚で回す
-      if (next.el.width !== vw || next.el.height !== vh) {
-        next.el.width = vw; next.el.height = vh;
-      }
-      next.ctx.drawImage(active, 0, 0, vw, vh);
-      const t0 = performance.now();
-      const pending = segmenter.segment(active);
-
-      // --- 3. Worker が推論している間に、前の対を合成する ---
-      // await のあとに置くと、メインスレッドの GPU 仕事と Worker が直列に並ぶ。
-      // 実機ではそれで 1 枚 50ms のうち 24ms が Worker の外に出ていた。
-      if (mask) {
-        display = shot;                        // ここで対が揃う
-        renderFrame();
+      // --- 1. 投げられるだけ投げる ---
+      // 控えは segment() と同じ同期ブロックで撮る。segment() の中の取り込み
+      // （drawImage）も await より手前で走るので、両者は必ず同じ1枚を見る。
+      while (inflight.length < DEPTH) {
+        const shot = shots[shotIdx];
+        shotIdx = (shotIdx + 1) % shots.length;
+        if (shot.el.width !== vw || shot.el.height !== vh) {
+          shot.el.width = vw; shot.el.height = vh;
+        }
+        shot.ctx.drawImage(active, 0, 0, vw, vh);
+        inflight.push({ shot, at: performance.now(), pending: segmenter.segment(active) });
       }
 
-      // --- 4. 待つ ---
+      // --- 2. いちばん古いぶんを待つ ---
+      const job = inflight.shift();
+      let mask;
       try {
-        mask = await pending;
+        mask = await job.pending;
       } catch (err) {
         console.error(err);
         fatal = true;
@@ -249,10 +250,15 @@ function startLoop() {
         return;
       }
       if (id !== loopId) return;               // await の間に切り替わっていたら捨てる
-      shot = next;
-      segMs = performance.now() - t0;
+      segMs = performance.now() - job.at;      // 投げてから返るまで（＝表示の遅れ）
       segCount++;
       lastTimings = mask.timings;              // 工程別の内訳（bench.html が読む）
+
+      // --- 3. 対で出す。バッファは返して使い回してもらう ---
+      updateMask(mask);
+      segmenter.recycle(mask);
+      display = job.shot;
+      renderFrame();
     }
   })();
 }

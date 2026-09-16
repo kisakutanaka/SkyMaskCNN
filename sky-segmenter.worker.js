@@ -43,14 +43,22 @@ const buf = (key, len) => {
   return a;
 };
 
-self.onmessage = async (e) => {
+// 受け取った順に 1 枚ずつ処理する。onmessage を直接 async にすると、
+// session.run を待っている間に次のメッセージが割り込んで、共有している
+// 作業用バッファを壊す（呼び出し側が 2 枚以上同時に投げられるため）。
+let chain = Promise.resolve();
+let lastEnd = 0; // 前の 1 枚を終えた時刻。次が来るまでの空き時間を測る
+
+self.onmessage = (e) => {
   const msg = e.data;
-  try {
-    if (msg.type === 'init') await init(msg.cfg, msg.id);
-    else if (msg.type === 'frame') await frame(msg);
-  } catch (err) {
-    self.postMessage({ type: 'error', id: msg.id, message: err?.message ?? String(err) });
-  }
+  chain = chain.then(async () => {
+    try {
+      if (msg.type === 'init') await init(msg.cfg, msg.id);
+      else if (msg.type === 'frame') await frame(msg);
+    } catch (err) {
+      self.postMessage({ type: 'error', id: msg.id, message: err?.message ?? String(err) });
+    }
+  });
 };
 
 async function init(options, id) {
@@ -95,6 +103,9 @@ async function init(options, id) {
 async function frame({ id, bitmap, out }) {
   const timings = {};
   let t = performance.now();
+  // 前の 1 枚を終えてから次が届くまでの空き。ここが大きいと、Worker は
+  // 仕事を待って遊んでいる＝呼び出し側の往復がボトルネックということ。
+  timings['Worker の空き'] = lastEnd ? t - lastEnd : 0;
   const mk = (k) => { timings[k] = performance.now() - t; t = performance.now(); };
   const whole = performance.now();
 
@@ -170,6 +181,7 @@ async function frame({ id, bitmap, out }) {
   if (!cfg.refineRadius) {
     const flat = sharpen(coarse, cfg.edgeSharpness, take(out, area));
     timings['合計'] = performance.now() - whole;
+    lastEnd = performance.now();
     self.postMessage({ type: 'mask', id, width: w, height: h, data: flat, timings }, [flat.buffer]);
     return;
   }
@@ -228,6 +240,7 @@ async function frame({ id, bitmap, out }) {
   }
   mk('ガイデッドフィルタ');
   timings['合計'] = performance.now() - whole;
+  lastEnd = performance.now();
 
   self.postMessage({ type: 'mask', id, width: capture, height: capture, data: mask, timings }, [mask.buffer]);
 }
