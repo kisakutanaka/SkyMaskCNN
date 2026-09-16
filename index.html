@@ -52,7 +52,10 @@
 
 
 <script type="module">
-import { createSkySegmenter } from './sky-segmenter.js';
+// ?v= は古いキャッシュとの食い違いを防ぐための版数。sky-segmenter.js /
+// sky-segmenter.worker.js に手を入れたら、ここと sky-segmenter.js の両方を上げる。
+// （片方だけ新しくなると、新しい index.html が古い API を呼んで静かに止まる）
+import { createSkySegmenter } from './sky-segmenter.js?v=2';
 
 // テストソース。増やすときはここに1行足すだけ。
 const SOURCES = [
@@ -193,11 +196,19 @@ const stats = document.getElementById('stats');
 let accDraw = 0, nDraw = 0, lastStats = performance.now();
 let segMs = 0, segCount = 0, lastTimings = null;
 let fatal = false;                             // 出たら stats はエラー表示のまま固定
+let loopStarted = 0;
 function report() {
   if (fatal) return;
   const now = performance.now();
   const span = now - lastStats;
-  if (!nDraw || span < 1) return;
+  if (span < 1) return;
+  if (!nDraw) {                                // まだ 1 枚も出ていない
+    if (loopStarted && now - loopStarted > 6000) {
+      stats.textContent = '分離の結果が返ってきません（再読み込みしてください）';
+    }
+    lastStats = now;
+    return;
+  }
   const drawFps = (nDraw / span) * 1000;
   const segFps = (segCount / span) * 1000;
   const period = segCount ? span / segCount : 0;
@@ -216,6 +227,11 @@ setInterval(report, 1000);
 let loopId = 0;
 function startLoop() {
   const id = ++loopId;
+  loopStarted = performance.now();
+  // ループ全体を囲む。どこで転んでも画面に出す。ここを細かく囲むと、
+  // 囲み忘れたところで例外が出たときにループごと静かに死ぬ（実際に
+  // recycle() の追加でそれが起きた: 古いキャッシュの sky-segmenter.js には
+  // その関数が無く、背景分離が 1 枚も出ないまま止まっていた）。
   (async () => {
     const inflight = [];                       // 投げてあるぶん（先頭が最も古い）
     while (id === loopId) {
@@ -240,15 +256,7 @@ function startLoop() {
 
       // --- 2. いちばん古いぶんを待つ ---
       const job = inflight.shift();
-      let mask;
-      try {
-        mask = await job.pending;
-      } catch (err) {
-        console.error(err);
-        fatal = true;
-        stats.textContent = `推論エラー: ${err.message}`;
-        return;
-      }
+      const mask = await job.pending;
       if (id !== loopId) return;               // await の間に切り替わっていたら捨てる
       segMs = performance.now() - job.at;      // 投げてから返るまで（＝表示の遅れ）
       segCount++;
@@ -260,7 +268,11 @@ function startLoop() {
       display = job.shot;
       renderFrame();
     }
-  })();
+  })().catch((err) => {
+    console.error(err);
+    fatal = true;
+    stats.textContent = `止まりました: ${err.message}（再読み込みしてください）`;
+  });
 }
 globalThis.segTimings = () => lastTimings;     // 計測ページ用の覗き窓
 
