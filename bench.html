@@ -58,6 +58,8 @@
   <a href="?coeff=128">128（現行）</a> / <a href="?coeff=256">256</a>
   <br>depth（同時に Worker へ投げる枚数）:
   <a href="?depth=2">2（現行）</a> / <a href="?depth=1">1</a>
+  <br>capture（取り込んだ1枚の渡し方）:
+  <a href="?capture=async">async（現行）</a> / <a href="?capture=transfer">transfer</a>
   <br>実際に効いた値は下の行に出ます。
 </p>
 <pre id="breakdown">計測待ち…</pre>
@@ -76,7 +78,7 @@
 // ?v= は古いキャッシュとの食い違いを防ぐための版数。sky-segmenter.js /
 // sky-segmenter.worker.js に手を入れたら、ここと sky-segmenter.js の両方を上げる。
 // （片方だけ新しくなると、新しい index.html が古い API を呼んで静かに止まる）
-import { createSkySegmenter } from './sky-segmenter.js?v=2';
+import { createSkySegmenter } from './sky-segmenter.js?v=3';
 
 // テストソース。増やすときはここに1行足すだけ。
 const SOURCES = [
@@ -95,10 +97,12 @@ const params = new URLSearchParams(location.search);
 const REFINE = Number(params.get('refine')) || 512;
 const COEFF = Number(params.get('coeff')) || 128;
 const DEPTH_Q = Number(params.get('depth')) || 0;
+const CAPTURE = params.get('capture') || 'async';
 const SEGMENTER_OPTIONS = {
   modelUrl: './models/tinyskynet_skyseg_256.onnx',
   refineSize: REFINE,
   coeffSize: COEFF,
+  captureMode: CAPTURE,
 };
 
 // 同時に Worker へ投げておく枚数。1 だと「投げる→待つ→次を投げる」になり、

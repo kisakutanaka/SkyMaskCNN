@@ -55,7 +55,7 @@
 // ?v= は古いキャッシュとの食い違いを防ぐための版数。sky-segmenter.js /
 // sky-segmenter.worker.js に手を入れたら、ここと sky-segmenter.js の両方を上げる。
 // （片方だけ新しくなると、新しい index.html が古い API を呼んで静かに止まる）
-import { createSkySegmenter } from './sky-segmenter.js?v=2';
+import { createSkySegmenter } from './sky-segmenter.js?v=3';
 
 // テストソース。増やすときはここに1行足すだけ。
 const SOURCES = [

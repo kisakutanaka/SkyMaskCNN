@@ -42,6 +42,12 @@ export const SKY_SEGMENTER_DEFAULTS = {
   // 確率の 0→1 遷移をどれだけ立てるか。1 でそのまま、大きいほど輪郭がくっきりする。
   // 0.5 を境に (p-0.5)*k+0.5 で伸ばすだけなので、位置はずらさず境界の幅だけ縮む。
   edgeSharpness: 6,
+  // 取り込んだ 1 枚を Worker へ渡す方法。
+  //   'async'    : createImageBitmap(canvas)。非同期なので、GPU の描画完了を
+  //                待つ間もメインスレッドは止まらない（既定）
+  //   'transfer' : OffscreenCanvas.transferToImageBitmap()。同期。実機では
+  //                その直後の postMessage で 33ms 待たされた（熱ダレ時）
+  captureMode: 'async',
   // onnxruntime-web。ESM 版を Worker 側が import する。
   ortUrl: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.wasm.min.mjs',
   ortWasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/',
@@ -50,7 +56,7 @@ export const SKY_SEGMENTER_DEFAULTS = {
 export async function createSkySegmenter(options = {}) {
   const cfg = { ...SKY_SEGMENTER_DEFAULTS, ...options };
   // ?v= は index.html 側と揃える（古いキャッシュとの食い違いを防ぐ）
-  const worker = new Worker(new URL('./sky-segmenter.worker.js?v=2', import.meta.url), {
+  const worker = new Worker(new URL('./sky-segmenter.worker.js?v=3', import.meta.url), {
     type: 'module',
   });
 
@@ -87,7 +93,9 @@ export async function createSkySegmenter(options = {}) {
   // 元の要素から直接 createImageBitmap すると、実測で 1958×1290 の静止画に
   // 14.8ms かかる（フル解像度のビットマップを作るため。resizeWidth を付けても
   // 変わらない）。小さいキャンバスへ一度描いてから渡すと 0.6ms で済む。
-  const capture = new OffscreenCanvas(ready.maskSize, ready.maskSize);
+  const capture = cfg.captureMode === 'transfer'
+    ? new OffscreenCanvas(ready.maskSize, ready.maskSize)
+    : Object.assign(document.createElement('canvas'), { width: ready.maskSize, height: ready.maskSize });
   const captureCtx = capture.getContext('2d');
 
   // 返し終わったマスクのバッファを貯めておき、次のフレームで Worker へ返す。
@@ -109,15 +117,22 @@ export async function createSkySegmenter(options = {}) {
     // 起こさない。正方形に潰すのもここ（縦横比は呼び出し側が拡大で戻す）。
     const t0 = performance.now();
     captureCtx.drawImage(source, 0, 0, capture.width, capture.height);
-    const bitmap = capture.transferToImageBitmap();
+    // ここで ImageBitmap にする。transferToImageBitmap は同期で、中身がまだ
+    // GPU 側にあると、その後の postMessage が完了待ちで止まる（実機で 33ms）。
+    // createImageBitmap は非同期なので、その待ちをメインスレッドの外に出せる。
+    const bitmap = cfg.captureMode === 'transfer'
+      ? capture.transferToImageBitmap()
+      : await createImageBitmap(capture);
     const out = pool.pop() ?? null;
     const transfer = [bitmap];
     if (out) transfer.push(out.buffer);
     const sync = performance.now() - t0;
-    const res = await ask({ type: 'frame', bitmap, out }, transfer);
+    const pending = ask({ type: 'frame', bitmap, out }, transfer);
+    const post = postMs;            // ask() の postMessage は同期。自分のぶんを今のうちに取る
+    const res = await pending;
     // 取り込みと往復も内訳に混ぜる。Worker 内の合計との差がここに出る。
     res.timings['取り込み(メイン)'] = sync;
-    res.timings['postMessage'] = postMs;
+    res.timings['postMessage'] = post;
     res.timings['往復と待ち'] = performance.now() - t0 - sync - res.timings['合計'];
     return res;
   }
