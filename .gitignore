@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+# ページが読み込むのは tinyskynet_skyseg_256.onnx だけ。教師モデル（23MB）は
+# 隣の SkySegmentation リポジトリにあるので、ここでは追跡しない。
+models/pp_mobileseg_base_ade20k_512.onnx
+models/LICENSE-PaddleSeg.txt

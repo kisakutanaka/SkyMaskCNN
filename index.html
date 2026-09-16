@@ -1,0 +1,260 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SkyMaskCNN</title>
+<style>
+  :root { --gutter: 8px; }
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.5 system-ui, sans-serif; }
+  header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; flex-wrap: wrap; }
+  #stats { font-variant-numeric: tabular-nums; color: #7c7; }
+  /* 余白は1か所で持つ。ソロ表示の重ね合わせが同じ値に依存するため。 */
+  .panes { display: flex; gap: var(--gutter); padding: 0 var(--gutter) var(--gutter); position: relative; }
+  .pane { flex: 1 1 0; min-width: 0; }
+
+  /* 分離結果のソロ表示。元映像は「消す」のではなく分離結果の真裏に重ねる。
+     video を display:none にしても画面外へ出しても、ブラウザは更新を止めてしまい
+     requestVideoFrameCallback が呼ばれなくなる（動画とカメラで ms/frame が止まる）。
+     画面内に置いたまま不透明なキャンバスで覆えば、更新は続いたまま見えなくなる。
+     元映像と分離結果は同じソース＝同じ幅・同じ縦横比なので過不足なく重なる。 */
+  body.solo .panes > .pane:first-child {
+    position: absolute; top: 0; left: var(--gutter); right: var(--gutter); z-index: 0;
+  }
+  body.solo .panes > .pane:last-child { position: relative; z-index: 1; }
+  /* 見出しは箱だけ残して文字を消す。display:none にすると高さが変わって重なりがずれる。 */
+  body.solo .panes > .pane:first-child h2 { visibility: hidden; }
+  .pane h2 { margin: 0 0 4px; font-size: 12px; font-weight: 400; color: #888; }
+  video, img, canvas { width: 100%; display: block; background: #000; }
+  /* 作者スタイルの display:block が UA の [hidden]{display:none} を打ち消すので明示する */
+  [hidden] { display: none !important; }
+  .pane { align-self: flex-start; }
+  select { font: inherit; padding: 3px 6px; }
+</style>
+
+<header>
+  <select id="source"></select>
+  <select id="mode">
+    <option value="kaiju">怪獣合成</option>
+    <option value="fill">空塗りつぶし</option>
+  </select>
+  <input type="color" id="fillColor" value="#ff00ff">
+  <label><input type="checkbox" id="solo"> 分離のみ</label>
+  <span id="stats">—</span>
+</header>
+
+<div class="panes">
+  <div class="pane">
+    <h2>元映像</h2>
+    <video id="video" muted loop playsinline hidden></video>
+    <img id="still" hidden>
+  </div>
+  <div class="pane"><h2>背景分離</h2><canvas id="out"></canvas></div>
+</div>
+
+<!-- sky-segmenter.js はグローバルの ort に依存する。module より先に実行される
+     クラシックスクリプトで読むので、import 時点では必ず定義済みになる。 -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.min.js"></script>
+
+<script type="module">
+import { createSkySegmenter } from './sky-segmenter.js';
+
+// テストソース。増やすときはここに1行足すだけ。
+const SOURCES = [
+  { label: '動画 (薄暮・パン)', kind: 'video', src: 'img/IMG_4476.mp4' },
+  { label: '曇天 01',           kind: 'still', src: 'img/cloudy01.png' },
+  { label: '曇天 02',           kind: 'still', src: 'img/cloudy02.png' },
+  { label: 'カメラ',            kind: 'camera' },
+];
+
+// 処理解像度はモデル側で決まる。tinyskynet_skyseg_256 は入力 256×256 固定
+// （出力は 128×128 のロジット）で、それをガイデッドフィルタで refineSize まで
+// 起こしたものがマスクになる。SkyMaskCV の PROC_PIXELS に相当するつまみはここ。
+// 入力が正方形固定なので縦横比は一度潰し、マスクを元の縦横比へ引き伸ばして戻す。
+const SEGMENTER_OPTIONS = {
+  modelUrl: './models/tinyskynet_skyseg_256.onnx',
+  refineSize: 512,
+};
+
+const video = document.getElementById('video');
+const still = document.getElementById('still');
+const mode = document.getElementById('mode');
+const fillColor = document.getElementById('fillColor');
+const out = document.getElementById('out');
+const outCtx = out.getContext('2d');
+
+const maskCv = makeCanvas(1, 1);             // マスクをアルファとして持つ
+let maskImg = null;                          // 解像度が変わるたびに作り直す
+const fg = makeCanvas(1, 1);                 // 手前レイヤー: 空を抜いた元映像
+
+let segmenter = null;                        // モデル読み込み完了まで null
+
+const kaiju = new Image();
+kaiju.src = 'kaiju.png';
+
+function makeCanvas(w, h) {
+  const el = document.createElement('canvas');
+  el.width = w; el.height = h;
+  return { el, ctx: el.getContext('2d', { willReadFrequently: true }) };
+}
+
+/** いま描画元になっている要素と、その実寸 */
+let active = video;
+const sizeOf = (el) => el === video
+  ? [el.videoWidth, el.videoHeight]
+  : [el.naturalWidth, el.naturalHeight];
+
+async function render() {
+  const [vw, vh] = sizeOf(active);
+  if (!vw) return;
+
+  if (out.width !== vw || out.height !== vh) {
+    out.width = vw; out.height = vh;
+    fg.el.width = vw; fg.el.height = vh;
+  }
+
+  // --- 1. 推論（映像の取り込みも正規化もセグメンタの中で完結する） ---
+  // 計測はこのフレームの全工程を覆う。取り込みの getImageData は GPU の描画完了を
+  // 待つ同期読み戻しで、推論と切り離しても減らない固定費なので推論側に含めて数える。
+  const tFrame = performance.now();
+  const tSeg = performance.now();
+  const mask = await segmenter.segment(active);   // data[i] = 空である確率 0..1
+  const segMs = performance.now() - tSeg;
+
+  // --- 2. マスクをアルファに載せる（空=不透明） ---
+  // 古典CV版は 0/1 の二値だが、CNN はそのまま確率を返す。しきい値で潰さずに
+  // アルファへ流し込むと、境界が確率のままぼけて合成が馴染む。
+  const { width: mw, height: mh, data } = mask;
+  if (maskCv.el.width !== mw || maskCv.el.height !== mh) {
+    maskCv.el.width = mw; maskCv.el.height = mh;
+    maskImg = maskCv.ctx.createImageData(mw, mh);
+  }
+  for (let i = 0; i < data.length; i++) maskImg.data[i * 4 + 3] = data[i] * 255;
+  maskCv.ctx.putImageData(maskImg, 0, 0);
+
+  // --- 3. 手前レイヤー: 元映像から空を抜く ---
+  fg.ctx.globalCompositeOperation = 'source-over';
+  fg.ctx.clearRect(0, 0, vw, vh);
+  fg.ctx.drawImage(active, 0, 0, vw, vh);
+  fg.ctx.globalCompositeOperation = 'destination-out';
+  fg.ctx.drawImage(maskCv.el, 0, 0, vw, vh);   // GPU が拡大（正方形→元の縦横比に戻る）
+
+  // --- 4. 奥から順に重ねる ---
+  // 手前レイヤー（空を抜いた元映像 = 建物）は両モード共通。奥だけが違う。
+  if (mode.value === 'fill') {
+    outCtx.fillStyle = fillColor.value;
+    outCtx.fillRect(0, 0, vw, vh);             // 奥:   単色プレーン
+  } else {
+    outCtx.drawImage(active, 0, 0, vw, vh);    // 奥:   元映像（空はここが見える）
+    drawKaiju(vw, vh);                         // 中:   怪獣（加工なし）
+  }
+  outCtx.drawImage(fg.el, 0, 0);               // 手前: 空を抜いた元映像 = 建物
+
+  // drawImage は GPU に積むだけで完了を待たないので、合成の実コストは
+  // ここに全部は現れない。それでも合成の発行は区間に入る。
+  report(segMs, performance.now() - tFrame, mw, mh);
+}
+
+// 大きさも位置も「高さ」基準で決める。幅基準にすると横長のソースで
+// 幅由来の大きさが画面の高さを超え、上にはみ出す（cloudy01 で発生）。
+const KAIJU_HEIGHT = 0.40;   // 画面の高さに対する怪獣の高さ
+const KAIJU_FEET   = 0.58;   // 足元を置く高さ（0=上端, 1=下端）
+
+function drawKaiju(vw, vh) {
+  if (!kaiju.complete) return;
+  const h = vh * KAIJU_HEIGHT;
+  const w = h * kaiju.width / kaiju.height;
+  outCtx.drawImage(kaiju, (vw - w) / 2, vh * KAIJU_FEET - h, w, h);
+}
+
+const stats = document.getElementById('stats');
+// 平均をとる本数。古典CV版は 15 本だが、CNN は 1 フレームが 2 桁 ms 〜 数百 ms に
+// なるので、同じ本数だと表示が数秒に 1 回しか更新されない。
+const REPORT_FRAMES = 5;
+let accSeg = 0, accAll = 0, n = 0;
+function report(segMs, allMs, mw, mh) {
+  accSeg += segMs; accAll += allMs; n++;
+  if (n < REPORT_FRAMES) return;
+  const seg = accSeg / n, all = accAll / n;
+  stats.textContent = `${all.toFixed(2)} ms/frame  ${(1000 / all).toFixed(0)} fps相当`
+                    + `  (推論 ${seg.toFixed(2)} / 合成 ${(all - seg).toFixed(2)})  ${mw}×${mh}`;
+  accSeg = accAll = n = 0;
+}
+
+// --- ループ ---
+// 動画は requestVideoFrameCallback で同じフレームを二度処理しないようにする
+// （rAF だと 60Hz で 30fps の映像を舐めて計測値が実態とずれる）。
+// 静止画は rAF。処理は冗長だが、ms/frame を出し続けるのが目的なのでそれでよい。
+// 推論が await で 1 フレームを跨ぐので、次の予約は必ず完了後に出す
+// （でないと推論が重なり、ort の worker に問い合わせが積み上がる）。
+let loopId = 0;
+function startLoop() {
+  const id = ++loopId;
+  const step = async () => {
+    if (id !== loopId) return;                 // ソース切替で古いループを止める
+    try {
+      await render();
+    } catch (err) {
+      console.error(err);
+      stats.textContent = `推論エラー: ${err.message}`;
+      return;
+    }
+    if (id !== loopId) return;                 // await の間に切り替わっていたら捨てる
+    if (active === video && video.requestVideoFrameCallback) video.requestVideoFrameCallback(step);
+    else requestAnimationFrame(step);
+  };
+  step();
+}
+
+// --- ソース切替 ---
+const select = document.getElementById('source');
+SOURCES.forEach((s, i) => select.add(new Option(s.label, String(i))));
+
+async function selectSource(i) {
+  const s = SOURCES[i];
+
+  loopId++;                                    // 走っているループをまず止める
+  video.srcObject?.getTracks().forEach((t) => t.stop());
+  video.srcObject = null;
+  video.removeAttribute('src');
+  video.load();
+
+  if (s.kind === 'still') {
+    active = still;
+    video.hidden = true; still.hidden = false;
+    still.src = s.src;
+    await still.decode().catch(() => {});
+  } else {
+    active = video;
+    still.hidden = true; video.hidden = false;
+    if (s.kind === 'camera') {
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false,
+      });
+    } else {
+      video.src = s.src;
+    }
+    await video.play().catch(() => {});
+  }
+
+  stats.textContent = '—'; accSeg = accAll = n = 0;
+  startLoop();
+}
+
+select.onchange = () => selectSource(Number(select.value));
+
+// 元映像を引っ込めて分離結果だけを大きく出す。処理解像度は表示と独立なので
+// 速度にも品質にも影響しない。
+const solo = document.getElementById('solo');
+solo.onchange = () => document.body.classList.toggle('solo', solo.checked);
+solo.onchange();                              // 再読み込みで checked が復元される環境に備える
+
+// モデル（約 200KB）と wasm を取ってくるまでは 1 フレームも回せない。
+// ここだけが古典CV版と違って「起動を待つ」工程になる。
+stats.textContent = 'モデルを読み込んでいます…';
+try {
+  segmenter = await createSkySegmenter(SEGMENTER_OPTIONS);
+  selectSource(0);
+} catch (err) {
+  console.error(err);
+  stats.textContent = `モデルを読み込めませんでした: ${err.message}`;
+}
+</script>
