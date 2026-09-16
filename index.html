@@ -28,6 +28,12 @@
   [hidden] { display: none !important; }
   .pane { align-self: flex-start; }
   select { font: inherit; padding: 3px 6px; }
+  /* ?bench のときだけ差し込まれる */
+  #howto { margin: 0 12px 8px; color: #ca8; font-size: 12px; max-width: 46em; }
+  #howto a { color: #8ad; }
+  #breakdown { margin: 0 12px 8px; padding: 8px 10px; background: #000; color: #7c7;
+    font: 12px/1.5 ui-monospace, monospace; font-variant-numeric: tabular-nums;
+    white-space: pre; overflow-x: auto; }
 </style>
 
 <header>
@@ -52,9 +58,9 @@
 
 
 <script type="module">
-// ?v= は古いキャッシュとの食い違いを防ぐための版数。sky-segmenter.js /
-// sky-segmenter.worker.js に手を入れたら、ここと sky-segmenter.js の両方を上げる。
-// （片方だけ新しくなると、新しい index.html が古い API を呼んで静かに止まる）
+// ?v= は古いキャッシュとの食い違いを防ぐ版数。sky-segmenter 側に手を入れたら、
+// ここと sky-segmenter.js の Worker URL の両方を上げる（片方だけ新しくなると、
+// 新しい index.html が古い API を呼んで静かに止まる）。
 import { createSkySegmenter } from './sky-segmenter.js?v=3';
 
 // テストソース。増やすときはここに1行足すだけ。
@@ -65,53 +71,57 @@ const SOURCES = [
   { label: 'カメラ',            kind: 'camera' },
 ];
 
+// 構成はクエリで差し替えられる。?bench を付けると工程別の内訳も画面に出る
+// （実機にはコンソールが無いので、そのまま読めるようにしてある）。
+const params = new URLSearchParams(location.search);
+const num = (key, fallback) => Number(params.get(key)) || fallback;
+
 // 処理解像度はモデル側で決まる。tinyskynet_skyseg_256 は入力 256×256 固定
 // （出力は 128×128 のロジット）で、それをガイデッドフィルタで refineSize まで
-// 起こしたものがマスクになる。SkyMaskCV の PROC_PIXELS に相当するつまみはここ。
-// 入力が正方形固定なので縦横比は一度潰し、マスクを元の縦横比へ引き伸ばして戻す。
+// 起こしたものがマスクになる。入力が正方形固定なので縦横比は一度潰し、
+// マスクを元の縦横比へ引き伸ばして戻す。
 const SEGMENTER_OPTIONS = {
   modelUrl: './models/tinyskynet_skyseg_256.onnx',
-  refineSize: 512,
+  refineSize: num('refine', 512),
+  coeffSize: num('coeff', 128),
+  captureMode: params.get('capture') || 'async',
 };
 
 // 同時に Worker へ投げておく枚数。1 だと「投げる→待つ→次を投げる」になり、
-// 往復の待ち時間のあいだ Worker が遊ぶ（実機で 1 枚 46ms のうち 14ms が
-// メッセージの往復待ちだった。Mac では 0.1ms なので iOS 側の配送の都合）。
-// 2 にすると次の 1 枚が Worker の手元に積まれるので、その待ちが隠れる。
+// 往復の待ちのあいだ Worker が遊ぶ（実機で 1 枚 46ms のうち 14ms が待ちだった）。
+// 2 にすると次の 1 枚が Worker の手元に積まれ、その待ちが隠れる。
 // 引き換えに、表示は 1 枚ぶん余分に古くなる。
-const DEPTH = 2;
+const DEPTH = num('depth', 2);
 
 const video = document.getElementById('video');
 const still = document.getElementById('still');
 const mode = document.getElementById('mode');
 const fillColor = document.getElementById('fillColor');
+const stats = document.getElementById('stats');
 const out = document.getElementById('out');
 const outCtx = out.getContext('2d');
-
-const maskCv = makeCanvas(1, 1);             // マスクをアルファとして持つ
-let maskImg = null;                          // 解像度が変わるたびに作り直す
-const fg = makeCanvas(1, 1);                 // 手前レイヤー: 空を抜いた元映像
-
-// 分離に渡したフレームの控え。マスクが届いたら「そのマスクを作った元のフレーム」と
-// 対で合成する。最新フレームに古いマスクを載せると、カメラを振ったときに輪郭が
-// 1〜3 フレーム分ずれるため。表示レートは分離レートまで落ちるが、出る絵は必ず整合する。
-// 投げてある DEPTH 枚 + 表示中の 1 枚 + 余裕 1 枚。余裕がないと、表示した直後の
-// 1 枚に次のフレームを描いてしまい、モード変更などで描き直したときだけ
-// 「新しい映像 + 古いマスク」になる（合成そのものは順序が守られるので出ない）。
-const shots = Array.from({ length: DEPTH + 2 }, () => makeCanvas(1, 1));
-let shotIdx = 0;
-let display = null;                          // いま合成に使うフレーム（マスクと対）
-
-let segmenter = null;                        // モデル読み込み完了まで null
 
 const kaiju = new Image();
 kaiju.src = 'kaiju.png';
 
-function makeCanvas(w, h) {
+function makeCanvas() {
   const el = document.createElement('canvas');
-  el.width = w; el.height = h;
-  return { el, ctx: el.getContext('2d', { willReadFrequently: true }) };
+  return { el, ctx: el.getContext('2d') };
 }
+
+const maskCv = makeCanvas();                 // マスクをアルファとして持つ
+let maskImg = null;                          // 解像度が変わるたびに作り直す
+const fg = makeCanvas();                     // 手前レイヤー: 空を抜いた元映像
+
+// 分離に渡したフレームの控え。マスクが届いたら「そのマスクを作った元のフレーム」と
+// 対で合成する。最新フレームに古いマスクを載せると、カメラを振ったときに輪郭が
+// 1〜3 フレーム分ずれるため。表示レートは分離レートまで落ちるが、出る絵は必ず整合する。
+// 投げてある DEPTH 枚 + 表示中の 1 枚 + 余裕 1 枚を回す。
+const shots = Array.from({ length: DEPTH + 2 }, makeCanvas);
+let shotIdx = 0;
+let display = null;                          // いま合成に使うフレーム（マスクと対）
+
+let segmenter = null;                        // モデル読み込み完了まで null
 
 /** いま描画元になっている要素と、その実寸 */
 let active = video;
@@ -133,8 +143,6 @@ function updateMask({ width, height, data }) {
 
 // --- 描画 ---
 // マスクと、そのマスクを作った元のフレームが揃ったときだけ描く。
-// 毎フレーム描いて最新の映像に古いマスクを載せると、カメラを振ったときに
-// 輪郭がずれる。表示は分離のレートになるが、出る絵は必ず整合している。
 function renderFrame() {
   if (!display) return;
   const vw = display.el.width;
@@ -187,17 +195,64 @@ function drawKaiju(vw, vh) {
   outCtx.drawImage(kaiju, (vw - w) / 2, vh * KAIJU_FEET - h, w, h);
 }
 
+// --- ループ ---
+// 1 本だけ。DEPTH 枚を投げておき、返ってきた順に対で描く。
+// 全体を 1 つの catch で囲む。細かく囲むと、囲み忘れたところで例外が出たときに
+// ループごと静かに死ぬ（画面には何も出ないまま止まる、いちばん困る壊れ方）。
+let loopId = 0;
+function startLoop() {
+  const id = ++loopId;
+  loopStarted = performance.now();
+  (async () => {
+    const inflight = [];                       // 投げてあるぶん（先頭が最も古い）
+    while (id === loopId) {
+      const [vw, vh] = sizeOf(active);
+      if (!segmenter || !vw) {                 // 準備前、または寸法がまだ来ていない
+        await new Promise((r) => requestAnimationFrame(r));
+        continue;
+      }
+
+      // 投げられるだけ投げる。控えは segment() と同じ同期ブロックで撮る
+      // （segment() 側の取り込みも await より手前で走るので、必ず同じ1枚を見る）。
+      while (inflight.length < DEPTH) {
+        const shot = shots[shotIdx];
+        shotIdx = (shotIdx + 1) % shots.length;
+        if (shot.el.width !== vw || shot.el.height !== vh) {
+          shot.el.width = vw; shot.el.height = vh;
+        }
+        shot.ctx.drawImage(active, 0, 0, vw, vh);
+        inflight.push({ shot, at: performance.now(), pending: segmenter.segment(active) });
+      }
+
+      const job = inflight.shift();
+      const mask = await job.pending;
+      if (id !== loopId) return;               // await の間に切り替わっていたら捨てる
+
+      segMs = performance.now() - job.at;      // 投げてから返るまで（＝表示の遅れ）
+      segCount++;
+      sample(segMs, mask.timings);
+
+      updateMask(mask);
+      segmenter.recycle(mask);                 // バッファは返して使い回してもらう
+      display = job.shot;                      // ここで対が揃う
+      renderFrame();
+    }
+  })().catch((err) => {
+    console.error(err);
+    fatal = true;
+    stats.textContent = `止まりました: ${err.message}（再読み込みしてください）`;
+  });
+}
+
 // --- 計測 ---
-// 表示は「マスクとフレームの対が揃うたび」なので、描画レートは分離レートと
-// 同じになる。SkyMaskCV の「ms/frame」に対応するのは「分離 ms/枚」のほう。
+// 表示は「対が揃うたび」なので、描画レートは分離レートと同じになる。
+// SkyMaskCV の「ms/frame」に対応するのは「分離 ms/枚」のほう。
 // 「遅れ」は投げてから返るまでで、DEPTH 枚を同時に投げているぶん ms/枚 より長い。
 // 左の元映像だけはカメラのレートで動く。
-const stats = document.getElementById('stats');
-let accDraw = 0, nDraw = 0, lastStats = performance.now();
-let segMs = 0, segCount = 0, lastTimings = null;
-let fatal = false;                             // 出たら stats はエラー表示のまま固定
-let loopStarted = 0;
-function report() {
+let accDraw = 0, nDraw = 0, lastStats = performance.now(), loopStarted = 0;
+let segMs = 0, segCount = 0, fatal = false;
+
+setInterval(() => {
   if (fatal) return;
   const now = performance.now();
   const span = now - lastStats;
@@ -209,76 +264,71 @@ function report() {
     lastStats = now;
     return;
   }
-  const drawFps = (nDraw / span) * 1000;
-  const segFps = (segCount / span) * 1000;
-  const period = segCount ? span / segCount : 0;
-  stats.textContent = `表示 ${drawFps.toFixed(0)} fps (合成 ${(accDraw / nDraw).toFixed(2)} ms)`
-                    + `  分離 ${period.toFixed(1)} ms/枚 → ${segFps.toFixed(1)} fps`
+  stats.textContent = `表示 ${((nDraw / span) * 1000).toFixed(0)} fps`
+                    + ` (合成 ${(accDraw / nDraw).toFixed(2)} ms)`
+                    + `  分離 ${(span / segCount).toFixed(1)} ms/枚 → ${((segCount / span) * 1000).toFixed(1)} fps`
                     + `  遅れ ${segMs.toFixed(0)} ms`
                     + `  ${maskCv.el.width}×${maskCv.el.height}`;
   accDraw = 0; nDraw = 0; segCount = 0; lastStats = now;
-}
-setInterval(report, 1000);
+}, 1000);
 
-// --- ループ ---
-// 1 本だけ。分離が 1 枚終わるたびに、その元フレームと対で描く。
-// await を跨ぐので、次の1枚は必ず前の1枚が終わってから投げる
-// （重ねると古い結果を待つ遅れが積み上がる）。
-let loopId = 0;
-function startLoop() {
-  const id = ++loopId;
-  loopStarted = performance.now();
-  // ループ全体を囲む。どこで転んでも画面に出す。ここを細かく囲むと、
-  // 囲み忘れたところで例外が出たときにループごと静かに死ぬ（実際に
-  // recycle() の追加でそれが起きた: 古いキャッシュの sky-segmenter.js には
-  // その関数が無く、背景分離が 1 枚も出ないまま止まっていた）。
-  (async () => {
-    const inflight = [];                       // 投げてあるぶん（先頭が最も古い）
-    while (id === loopId) {
-      const [vw, vh] = sizeOf(active);
-      if (!segmenter || !vw) {                 // 準備前、または寸法がまだ来ていない
-        await new Promise((r) => requestAnimationFrame(r));
-        continue;
-      }
+// --- 工程別の内訳（?bench のときだけ）---
+// 直近 60 枚の中央値。値は Worker とメインスレッドが performance.now() で測った生の ms。
+const BENCH = params.has('bench');
+let sample = () => {};
+if (BENCH) {
+  const KEEP = 60;
+  const rings = new Map();
+  const median = (a) => [...a].sort((x, y) => x - y)[a.length >> 1];
+  const pad = (s, w) => s + ' '.repeat(Math.max(0, w - [...s]
+    .reduce((n, c) => n + (c.charCodeAt(0) > 0x2e80 ? 2 : 1), 0)));
 
-      // --- 1. 投げられるだけ投げる ---
-      // 控えは segment() と同じ同期ブロックで撮る。segment() の中の取り込み
-      // （drawImage）も await より手前で走るので、両者は必ず同じ1枚を見る。
-      while (inflight.length < DEPTH) {
-        const shot = shots[shotIdx];
-        shotIdx = (shotIdx + 1) % shots.length;
-        if (shot.el.width !== vw || shot.el.height !== vh) {
-          shot.el.width = vw; shot.el.height = vh;
-        }
-        shot.ctx.drawImage(active, 0, 0, vw, vh);
-        inflight.push({ shot, at: performance.now(), pending: segmenter.segment(active) });
-      }
-
-      // --- 2. いちばん古いぶんを待つ ---
-      const job = inflight.shift();
-      const mask = await job.pending;
-      if (id !== loopId) return;               // await の間に切り替わっていたら捨てる
-      segMs = performance.now() - job.at;      // 投げてから返るまで（＝表示の遅れ）
-      segCount++;
-      lastTimings = mask.timings;              // 工程別の内訳（bench.html が読む）
-
-      // --- 3. 対で出す。バッファは返して使い回してもらう ---
-      updateMask(mask);
-      segmenter.recycle(mask);
-      display = job.shot;
-      renderFrame();
+  sample = (totalMs, timings) => {
+    for (const [k, v] of [['分離（呼び出し側）', totalMs], ...Object.entries(timings)]) {
+      const a = rings.get(k) ?? rings.set(k, []).get(k);
+      a.push(v);
+      if (a.length > KEEP) a.shift();
     }
-  })().catch((err) => {
-    console.error(err);
-    fatal = true;
-    stats.textContent = `止まりました: ${err.message}（再読み込みしてください）`;
-  });
+  };
+
+  document.querySelector('header').insertAdjacentHTML('afterend', `
+    <p id="howto">
+      <b>これは計測用の表示です（?bench）。</b>本番は <a href="./">こちら</a>。
+      ソースで「カメラ」を選び、画面を消さずに 1 分ほど回してください。
+      <b>開始直後と 1 分後の両方</b>を控えます（熱ダレで配分が変わるため）。
+      <br>refine（取り込みと読み戻し。256 の整数倍に丸め）:
+      <a href="?bench&refine=512">512</a> / <a href="?bench&refine=256">256</a>
+      — coeff（ガイデッド係数。2 の冪に丸め）:
+      <a href="?bench&coeff=128">128</a> / <a href="?bench&coeff=256">256</a>
+      <br>depth（同時に投げる枚数）:
+      <a href="?bench&depth=2">2</a> / <a href="?bench&depth=1">1</a>
+      — capture（1枚の渡し方）:
+      <a href="?bench&capture=async">async</a> / <a href="?bench&capture=transfer">transfer</a>
+    </p>
+    <pre id="breakdown">計測待ち…</pre>`);
+  const breakdown = document.getElementById('breakdown');
+  const started = performance.now();
+
+  setInterval(() => {
+    if (!rings.size) return;
+    const total = median(rings.get('分離（呼び出し側）'));
+    breakdown.textContent =
+      `取り込み ${segmenter.maskSize}² / 係数 ${segmenter.coeffSize}² / depth ${DEPTH}`
+      + ` / capture ${SEGMENTER_OPTIONS.captureMode}`
+      + ` / 経過 ${((performance.now() - started) / 1000).toFixed(0)} 秒\n`
+      + [...rings].map(([k, a]) => {
+        const ms = median(a);
+        const pct = k.startsWith('分離') || k.startsWith('合計')
+          ? '' : `  ${((ms / total) * 100).toFixed(1).padStart(5)} %`;
+        return `  ${pad(k === '合計' ? 'Worker 内の合計' : k, 26)}${ms.toFixed(1).padStart(6)} ms${pct}`;
+      }).join('\n');
+  }, 1000);
 }
-globalThis.segTimings = () => lastTimings;     // 計測ページ用の覗き窓
 
 // --- ソース切替 ---
 const select = document.getElementById('source');
 SOURCES.forEach((s, i) => select.add(new Option(s.label, String(i))));
+select.onchange = () => selectSource(Number(select.value));
 
 async function selectSource(i) {
   const s = SOURCES[i];
@@ -312,8 +362,6 @@ async function selectSource(i) {
   accDraw = 0; nDraw = 0; segCount = 0; lastStats = performance.now();
   startLoop();
 }
-
-select.onchange = () => selectSource(Number(select.value));
 
 // 元映像を引っ込めて分離結果だけを大きく出す。処理解像度は表示と独立なので
 // 速度にも品質にも影響しない。
