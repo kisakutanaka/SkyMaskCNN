@@ -78,12 +78,27 @@ export async function createSkySegmenter(options = {}) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const guideHi = new Float32Array(capture * capture); // 高解像度の輝度ガイド
   const guideLo = new Float32Array(size * size); // 統計量計算用に縮小した輝度
+
+  // 作業用バッファ。毎フレーム確保すると 1 フレームで数 MB のゴミになり、
+  // モバイルでは GC が時々 1 フレーム分の時間を丸ごと奪う（実測で
+  // guidedCoeffs と boxFilter の内部だけで 1 フレーム 4MB 近く）。
+  // Worker へ転送される input 以外は使い回せるので、ここで 1 回だけ取る。
+  const scratch = new Map();
+  const buf = (key, len) => {
+    let a = scratch.get(key);
+    if (!a || a.length !== len) scratch.set(key, (a = new Float32Array(len)));
+    return a;
+  };
   const inputName = session.inputNames[0];
   const outputName = session.outputNames[0];
 
   /**
    * @param {CanvasImageSource} source video / canvas / img / ImageBitmap
    * @returns {Promise<{width:number, height:number, data:Float32Array}>} 空である確率(0..1)
+   *
+   * ※ data は内部で使い回しているバッファです。次の segment() で上書きされるので、
+   *   フレームを跨いで持つ場合は呼び出し側でコピーしてください
+   *   （毎フレーム 1MB の確保を避けるため。使い終わるまでに次を呼ばなければ安全）。
    */
   async function segment(source) {
     let t = performance.now();
@@ -143,7 +158,7 @@ export async function createSkySegmenter(options = {}) {
     // 5. 「空」と「空以外の最大」の 2 値ソフトマックス = sigmoid(sky - maxOther - margin)
     //    150 クラス全部の softmax より安く、境界がなめらかな確率になる。
     const area = h * w;
-    const coarse = new Float32Array(area);
+    const coarse = buf('coarse', area);
     if (numClasses === 1) {
       // 空/非空の二値モデル: ロジットをそのまま sigmoid するだけ
       for (let i = 0; i < area; i++) coarse[i] = 1 / (1 + Math.exp(-values[i]));
@@ -162,19 +177,19 @@ export async function createSkySegmenter(options = {}) {
 
     mk('6_sigmoid');
     if (!cfg.refineRadius) {
-      return { width: w, height: h, data: sharpen(coarse, cfg.edgeSharpness) };
+      return { width: w, height: h, data: sharpen(coarse, cfg.edgeSharpness, buf('sharp', area)) };
     }
 
     // 6. fast guided filter:
     //    線形係数 a, b は低解像度（inputSize）で求め、それを拡大して
     //    高解像度のガイドに当てる。box filter の計算量は据え置きのまま、
     //    輪郭だけ capture の解像度で吸着する（He et al. 2010 の 4.1 節）。
-    const pLo = bilinear(coarse, w, h, size);
-    const { a, b } = guidedCoeffs(guideLo, pLo, size, cfg.refineRadius, cfg.refineEps);
-    const aHi = bilinear(a, size, size, capture);
-    const bHi = bilinear(b, size, size, capture);
+    const pLo = bilinear(coarse, w, h, size, buf('pLo', size * size));
+    const { a, b } = guidedCoeffs(guideLo, pLo, size, cfg.refineRadius, cfg.refineEps, buf);
+    const aHi = bilinear(a, size, size, capture, buf('aHi', capture * capture));
+    const bHi = bilinear(b, size, size, capture, buf('bHi', capture * capture));
 
-    const out = new Float32Array(guideHi.length);
+    const out = buf('out', guideHi.length);
     const k = cfg.edgeSharpness;
     for (let i = 0; i < out.length; i++) {
       const v = (aHi[i] * guideHi[i] + bHi[i] - 0.5) * k + 0.5;
@@ -194,9 +209,8 @@ export async function createSkySegmenter(options = {}) {
 }
 
 /** 0.5 を境に確率のコントラストを立てる（遷移帯の幅を 1/k にする） */
-function sharpen(src, k) {
+function sharpen(src, k, dst = new Float32Array(src.length)) {
   if (!k || k === 1) return src;
-  const dst = new Float32Array(src.length);
   for (let i = 0; i < src.length; i++) {
     const v = (src[i] - 0.5) * k + 0.5;
     dst[i] = v < 0 ? 0 : v > 1 ? 1 : v;
@@ -204,9 +218,8 @@ function sharpen(src, k) {
   return dst;
 }
 
-/** 正方形マスクのバイリニア拡大 */
-function bilinear(src, w, h, size) {
-  const dst = new Float32Array(size * size);
+/** 正方形マスクのバイリニア拡大。dst を渡せばそこへ書く。 */
+function bilinear(src, w, h, size, dst = new Float32Array(size * size)) {
   const sx = w / size;
   const sy = h / size;
   for (let y = 0; y < size; y++) {
@@ -227,10 +240,12 @@ function bilinear(src, w, h, size) {
   return dst;
 }
 
-/** 移動平均（累積和による O(N) 実装） */
-function boxFilter(src, size, r) {
-  const tmp = new Float32Array(size * size);
-  const dst = new Float32Array(size * size);
+/**
+ * 移動平均（累積和による O(N) 実装）
+ * dst / tmp を渡せばそこへ書く。横方向は src→tmp、縦方向は tmp→dst なので、
+ * dst は src と同じ配列でも構わない（tmp だけは別の配列にすること）。
+ */
+function boxFilter(src, size, r, dst = new Float32Array(size * size), tmp = new Float32Array(size * size)) {
   for (let y = 0; y < size; y++) {
     const row = y * size;
     let sum = 0;
@@ -263,28 +278,32 @@ function boxFilter(src, size, r) {
  * a, b は元画像より滑らかなので、低解像度で求めて拡大しても品質がほとんど落ちない
  * （= fast guided filter）。
  */
-function guidedCoeffs(I, p, size, r, eps) {
+function guidedCoeffs(I, p, size, r, eps, buf = (key, len) => new Float32Array(len)) {
   const n = size * size;
-  const Ip = new Float32Array(n);
-  const II = new Float32Array(n);
+  const tmp = buf('box.tmp', n); // boxFilter の作業用。呼ぶたびに丸ごと上書きされる
+  const Ip = buf('gc.Ip', n);
+  const II = buf('gc.II', n);
   for (let i = 0; i < n; i++) {
     Ip[i] = I[i] * p[i];
     II[i] = I[i] * I[i];
   }
-  const meanI = boxFilter(I, size, r);
-  const meanP = boxFilter(p, size, r);
-  const meanIp = boxFilter(Ip, size, r);
-  const meanII = boxFilter(II, size, r);
+  const meanI = boxFilter(I, size, r, buf('gc.meanI', n), tmp);
+  const meanP = boxFilter(p, size, r, buf('gc.meanP', n), tmp);
+  const meanIp = boxFilter(Ip, size, r, buf('gc.meanIp', n), tmp);
+  const meanII = boxFilter(II, size, r, buf('gc.meanII', n), tmp);
 
-  const a = new Float32Array(n);
-  const b = new Float32Array(n);
+  const a = buf('gc.a', n);
+  const b = buf('gc.b', n);
   for (let i = 0; i < n; i++) {
     const cov = meanIp[i] - meanI[i] * meanP[i];
     const varI = meanII[i] - meanI[i] * meanI[i];
     a[i] = cov / (varI + eps);
     b[i] = meanP[i] - a[i] * meanI[i];
   }
-  return { a: boxFilter(a, size, r), b: boxFilter(b, size, r) };
+  return {
+    a: boxFilter(a, size, r, buf('gc.meanA', n), tmp),
+    b: boxFilter(b, size, r, buf('gc.meanB', n), tmp),
+  };
 }
 
 
